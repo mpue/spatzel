@@ -1,0 +1,33 @@
+#version 450
+
+// Milestone-1 probe pass: proves the compute -> storage image -> present path.
+// Writes an animated UV gradient; no actual raymarching yet.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform writeonly image2D uOutput;
+
+layout(push_constant) uniform Push {
+    vec2  resolution;
+    float time;
+} pc;
+
+void main() {
+    const ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    if (texel.x >= int(pc.resolution.x) || texel.y >= int(pc.resolution.y)) {
+        return;
+    }
+
+    const vec2 uv = (vec2(texel) + 0.5) / pc.resolution;
+
+    vec3 colour;
+    colour.r = uv.x;
+    colour.g = uv.y;
+    colour.b = 0.5 + 0.5 * sin(pc.time + (uv.x + uv.y) * 6.2831853);
+
+    // Faint moving band so motion is visible even on a static gradient.
+    const float band = 0.5 + 0.5 * sin((uv.x - uv.y) * 40.0 + pc.time * 2.0);
+    colour = mix(colour, vec3(band), 0.15);
+
+    imageStore(uOutput, texel, vec4(colour, 1.0));
+}
