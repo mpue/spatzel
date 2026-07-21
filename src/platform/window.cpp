@@ -21,9 +21,26 @@ GLFWwindow* asGlfw(void* handle) { return static_cast<GLFWwindow*>(handle); }
 
 int toGlfwKey(Key key) {
     switch (key) {
-        case Key::Escape: return GLFW_KEY_ESCAPE;
+        case Key::Escape:    return GLFW_KEY_ESCAPE;
+        case Key::W:         return GLFW_KEY_W;
+        case Key::A:         return GLFW_KEY_A;
+        case Key::S:         return GLFW_KEY_S;
+        case Key::D:         return GLFW_KEY_D;
+        case Key::Q:         return GLFW_KEY_Q;
+        case Key::E:         return GLFW_KEY_E;
+        case Key::LeftShift: return GLFW_KEY_LEFT_SHIFT;
+        case Key::Count:     break;
     }
     return GLFW_KEY_UNKNOWN;
+}
+
+int toGlfwMouseButton(MouseButton button) {
+    switch (button) {
+        case MouseButton::Left:  return GLFW_MOUSE_BUTTON_LEFT;
+        case MouseButton::Right: return GLFW_MOUSE_BUTTON_RIGHT;
+        case MouseButton::Count: break;
+    }
+    return GLFW_MOUSE_BUTTON_LAST + 1;
 }
 
 } // namespace
@@ -86,7 +103,62 @@ Window::~Window() {
     }
 }
 
-void Window::pollEvents() { glfwPollEvents(); }
+void Window::pollEvents() {
+    glfwPollEvents();
+    updateInput();
+}
+
+void Window::updateInput() {
+    GLFWwindow* handle = asGlfw(m_handle);
+
+    for (size_t i = 0; i < static_cast<size_t>(Key::Count); ++i) {
+        const int code = toGlfwKey(static_cast<Key>(i));
+        m_input.m_keys[i] = code != GLFW_KEY_UNKNOWN &&
+                            glfwGetKey(handle, code) == GLFW_PRESS;
+    }
+    for (size_t i = 0; i < static_cast<size_t>(MouseButton::Count); ++i) {
+        const int code = toGlfwMouseButton(static_cast<MouseButton>(i));
+        m_input.m_buttons[i] = glfwGetMouseButton(handle, code) == GLFW_PRESS;
+    }
+
+    // Look is a hold-to-engage gesture: the cursor is only captured while the
+    // right button is down, so the window stays resizable and alt-tab keeps
+    // working without any special handling.
+    const bool wantCapture = m_input.isDown(MouseButton::Right);
+    if (wantCapture != m_input.m_cursorCaptured) {
+        setCursorCaptured(wantCapture);
+    }
+
+    double x = 0.0;
+    double y = 0.0;
+    glfwGetCursorPos(handle, &x, &y);
+    if (m_input.m_cursorCaptured) {
+        m_input.m_cursorDeltaX = x - m_lastCursorX;
+        m_input.m_cursorDeltaY = y - m_lastCursorY;
+    } else {
+        m_input.m_cursorDeltaX = 0.0;
+        m_input.m_cursorDeltaY = 0.0;
+    }
+    m_lastCursorX = x;
+    m_lastCursorY = y;
+}
+
+void Window::setCursorCaptured(bool captured) {
+    GLFWwindow* handle = asGlfw(m_handle);
+    glfwSetInputMode(handle, GLFW_CURSOR, captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
+    if (glfwRawMouseMotionSupported() == GLFW_TRUE) {
+        // Unaccelerated motion while looking around; the desktop pointer keeps
+        // its acceleration when the capture ends.
+        glfwSetInputMode(handle, GLFW_RAW_MOUSE_MOTION, captured ? GLFW_TRUE : GLFW_FALSE);
+    }
+    m_input.m_cursorCaptured = captured;
+
+    // Re-seed the reference position so the first frame after a transition
+    // reports no movement instead of the jump GLFW just introduced.
+    glfwGetCursorPos(handle, &m_lastCursorX, &m_lastCursorY);
+    m_input.m_cursorDeltaX = 0.0;
+    m_input.m_cursorDeltaY = 0.0;
+}
 
 void Window::waitEvents() const { glfwWaitEvents(); }
 
@@ -95,10 +167,6 @@ bool Window::shouldClose() const {
 }
 
 void Window::requestClose() { glfwSetWindowShouldClose(asGlfw(m_handle), GLFW_TRUE); }
-
-bool Window::isKeyDown(Key key) const {
-    return glfwGetKey(asGlfw(m_handle), toGlfwKey(key)) == GLFW_PRESS;
-}
 
 Extent2D Window::framebufferSize() const {
     int w = 0;

@@ -107,7 +107,7 @@ bool Application::run() {
     while (!m_window.shouldClose()) {
         m_window.pollEvents();
 
-        if (m_window.isKeyDown(platform::Key::Escape)) {
+        if (m_window.input().isDown(platform::Key::Escape)) {
             m_window.requestClose();
             continue;
         }
