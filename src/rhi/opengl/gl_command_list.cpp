@@ -33,11 +33,14 @@ void GlCommandList::bindStorageBuffer(uint32_t slot, BufferHandle handle) {
 
 void GlCommandList::dispatch(uint32_t gx, uint32_t gy, uint32_t gz) {
     // GL's equivalent of the Vulkan backend's pre-dispatch barrier: make any
-    // earlier read of these images complete before the shader writes them.
-    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+    // earlier access to these images and buffers complete before the shader
+    // touches them. The storage-buffer bit is what makes the dispatch-ordering
+    // guarantee in rhi.hpp true for a multi-pass algorithm.
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
     glDispatchCompute(gx, gy, gz);
     // And the post-dispatch half, so the blit and any readback see the writes.
-    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT |
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT |
+                    GL_BUFFER_UPDATE_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT |
                     GL_TEXTURE_UPDATE_BARRIER_BIT);
 }
 

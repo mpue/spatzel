@@ -283,6 +283,21 @@ void GlDevice::readTexture(TextureHandle handle, std::span<float> out) {
                       static_cast<GLsizei>(texelCount * 4 * sizeof(float)), out.data());
 }
 
+void GlDevice::readBuffer(BufferHandle handle, std::span<std::byte> out, uint64_t offset) {
+    const GlBuffer& buffer = m_buffers.get(handle);
+    if (offset + out.size() > static_cast<uint64_t>(buffer.size)) {
+        throw std::runtime_error("rhi: readBuffer would read past the end of the buffer");
+    }
+    if (out.empty()) {
+        return;
+    }
+
+    // Anything a compute pass wrote has to be visible to the client read.
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
+    glGetNamedBufferSubData(buffer.buffer, static_cast<GLintptr>(offset),
+                            static_cast<GLsizeiptr>(out.size()), out.data());
+}
+
 void GlDevice::destroy(TextureHandle handle) {
     const GlTexture texture = m_textures.remove(handle);
     glDeleteTextures(1, &texture.texture);

@@ -81,6 +81,7 @@ public:
     void updateBuffer(BufferHandle handle, std::span<const std::byte> data,
                       uint64_t offset) override;
     void readTexture(TextureHandle handle, std::span<float> out) override;
+    void readBuffer(BufferHandle handle, std::span<std::byte> out, uint64_t offset) override;
 
     void destroy(TextureHandle handle) override;
     void destroy(BufferHandle handle) override;

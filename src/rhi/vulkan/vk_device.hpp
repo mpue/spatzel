@@ -83,6 +83,7 @@ public:
     void updateBuffer(BufferHandle handle, std::span<const std::byte> data,
                       uint64_t offset) override;
     void readTexture(TextureHandle handle, std::span<float> out) override;
+    void readBuffer(BufferHandle handle, std::span<std::byte> out, uint64_t offset) override;
 
     void destroy(TextureHandle handle) override;
     void destroy(BufferHandle handle) override;
@@ -111,7 +112,7 @@ private:
     void defer(std::function<void()> deleter);
 
     // Runs a short command buffer and blocks until it has completed. Used only
-    // by readTexture; the frame path never needs it.
+    // by the readback paths; the frame path never needs it.
     void submitBlocking(const std::function<void(VkCommandBuffer)>& record);
 
     // Barrier helpers — the whole reason transitions never surface in rhi.hpp.

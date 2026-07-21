@@ -870,6 +870,52 @@ void VulkanDevice::readTexture(TextureHandle handle, std::span<float> out) {
     vmaDestroyBuffer(m_allocator, staging, allocation);
 }
 
+void VulkanDevice::readBuffer(BufferHandle handle, std::span<std::byte> out, uint64_t offset) {
+    const Buffer& buffer = m_buffers.get(handle);
+    if (offset + out.size() > buffer.size) {
+        throw std::runtime_error("rhi: readBuffer would read past the end of the buffer");
+    }
+    if (out.empty()) {
+        return;
+    }
+
+    // Same reasoning as readTexture: whatever the frame path may still be doing
+    // with this buffer has to finish before it can be copied out.
+    FITZEL_CHECK(vkDeviceWaitIdle(m_device.device));
+
+    const VkDeviceSize       byteCount = out.size();
+    const VkBufferCreateInfo bufferInfo{
+        .sType                 = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .pNext                 = nullptr,
+        .flags                 = 0,
+        .size                  = byteCount,
+        .usage                 = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .sharingMode           = VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices   = nullptr,
+    };
+    VmaAllocationCreateInfo allocInfo{};
+    allocInfo.usage = VMA_MEMORY_USAGE_AUTO;
+    allocInfo.flags =
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+    VkBuffer          staging    = VK_NULL_HANDLE;
+    VmaAllocation     allocation = VK_NULL_HANDLE;
+    VmaAllocationInfo allocated{};
+    FITZEL_CHECK(
+        vmaCreateBuffer(m_allocator, &bufferInfo, &allocInfo, &staging, &allocation, &allocated));
+
+    submitBlocking([&](VkCommandBuffer cmd) {
+        const VkBufferCopy region{.srcOffset = offset, .dstOffset = 0, .size = byteCount};
+        vkCmdCopyBuffer(cmd, buffer.buffer, staging, 1, &region);
+    });
+
+    FITZEL_CHECK(vmaInvalidateAllocation(m_allocator, allocation, 0, byteCount));
+    std::memcpy(out.data(), allocated.pMappedData, out.size());
+
+    vmaDestroyBuffer(m_allocator, staging, allocation);
+}
+
 void VulkanDevice::destroy(TextureHandle handle) {
     const Texture texture = m_textures.remove(handle);
     defer([this, texture] {

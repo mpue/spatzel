@@ -65,6 +65,35 @@ void VulkanCommandList::flushBindings() {
                                        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     }
 
+    // The buffer half of the same guarantee. Storage buffers have no layout to
+    // transition, so this is a plain execution + memory dependency covering
+    // every dispatch recorded earlier in this command buffer. Emitted
+    // unconditionally rather than per bound buffer: a global memory barrier is
+    // not a per-resource construct, and the contract in rhi.hpp promises the
+    // ordering for every dispatch, not only for the ones this list can see the
+    // producer of.
+    const VkMemoryBarrier2 memoryBarrier{
+        .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+        .pNext         = nullptr,
+        .srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        .dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .dstAccessMask =
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+    };
+    const VkDependencyInfo dependency{
+        .sType                    = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .pNext                    = nullptr,
+        .dependencyFlags          = 0,
+        .memoryBarrierCount       = 1,
+        .pMemoryBarriers          = &memoryBarrier,
+        .bufferMemoryBarrierCount = 0,
+        .pBufferMemoryBarriers    = nullptr,
+        .imageMemoryBarrierCount  = 0,
+        .pImageMemoryBarriers     = nullptr,
+    };
+    vkCmdPipelineBarrier2(m_cmd, &dependency);
+
     if (!pipeline.hasBindings || !m_bindingsDirty) {
         return;
     }

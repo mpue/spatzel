@@ -192,6 +192,15 @@ public:
     virtual void pushConstants(std::span<const std::byte> data)        = 0;
     virtual void bindStorageTexture(uint32_t slot, TextureHandle tex)  = 0;
     virtual void bindStorageBuffer(uint32_t slot, BufferHandle buffer) = 0;
+
+    // Dispatches are ordered against each other: everything a dispatch writes
+    // to a storage texture or a storage buffer is visible to every dispatch
+    // recorded after it, and to a subsequent blitToSwapchain or readback.
+    //
+    // Stated because a multi-pass algorithm depends on it and cannot express it
+    // — barriers are deliberately absent from this interface, so the guarantee
+    // has to live in the contract instead. Ordering only, never a
+    // synchronisation primitive the caller can reach.
     virtual void dispatch(uint32_t gx, uint32_t gy, uint32_t gz)       = 0;
 
     // Copies `src` into the image that will be presented this frame, scaling
@@ -262,6 +271,13 @@ public:
     // from the top-left texel. `out` must hold width * height * 4 values.
     // Intended for verification, not for a rendering path.
     virtual void readTexture(TextureHandle texture, std::span<float> out) = 0;
+
+    // Blocking read of raw buffer bytes. The buffer must have been created with
+    // BufferUsage::CopySrc. Like readTexture this is a verification path — it
+    // may stall the device — and exists so that what a compute pass wrote into
+    // a buffer can be inspected rather than only believed.
+    virtual void readBuffer(BufferHandle buffer, std::span<std::byte> out,
+                            uint64_t offset = 0) = 0;
 
     virtual void destroy(TextureHandle handle)  = 0;
     virtual void destroy(BufferHandle handle)   = 0;
