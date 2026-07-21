@@ -1,0 +1,71 @@
+#include "rhi/vulkan/vk_swapchain.hpp"
+
+#include <stdexcept>
+
+namespace rhi::vulkan {
+
+Swapchain::Swapchain(vkb::Device& device, VkExtent2D extent) : m_device(device) {
+    build(extent, VK_NULL_HANDLE);
+}
+
+Swapchain::~Swapchain() {
+    destroyImageResources();
+    vkb::destroy_swapchain(m_swapchain);
+}
+
+void Swapchain::recreate(VkExtent2D extent) {
+    const VkSwapchainKHR old = m_swapchain.swapchain;
+    destroyImageResources();
+
+    vkb::Swapchain previous = m_swapchain;
+    build(extent, old);
+    vkb::destroy_swapchain(previous);
+}
+
+void Swapchain::build(VkExtent2D extent, VkSwapchainKHR oldSwapchain) {
+    vkb::SwapchainBuilder builder(m_device);
+    builder.set_desired_extent(extent.width, extent.height)
+        // FIFO is always supported and keeps the loop from spinning.
+        .set_desired_present_mode(VK_PRESENT_MODE_FIFO_KHR)
+        // The compute result is blitted in, so the image must be a transfer
+        // destination as well as a colour attachment.
+        .set_image_usage_flags(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                               VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    if (oldSwapchain != VK_NULL_HANDLE) {
+        builder.set_old_swapchain(oldSwapchain);
+    }
+
+    auto result = builder.build();
+    if (!result) {
+        throw std::runtime_error("swapchain creation failed: " + result.error().message());
+    }
+    m_swapchain = result.value();
+
+    auto images = m_swapchain.get_images();
+    if (!images) {
+        throw std::runtime_error("swapchain image query failed: " + images.error().message());
+    }
+    m_images = images.value();
+    m_layouts.assign(m_images.size(), VK_IMAGE_LAYOUT_UNDEFINED);
+
+    // One presentation semaphore per swapchain image, not per frame in flight:
+    // a frame-indexed semaphore can still be pending in the presentation
+    // engine when it is reused, which the validation layers reject.
+    m_renderFinished.resize(m_images.size());
+    const VkSemaphoreCreateInfo semaphoreInfo{
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = nullptr, .flags = 0};
+    for (VkSemaphore& semaphore : m_renderFinished) {
+        FITZEL_CHECK(vkCreateSemaphore(m_device.device, &semaphoreInfo, nullptr, &semaphore));
+    }
+}
+
+void Swapchain::destroyImageResources() {
+    for (VkSemaphore semaphore : m_renderFinished) {
+        vkDestroySemaphore(m_device.device, semaphore, nullptr);
+    }
+    m_renderFinished.clear();
+    m_images.clear();
+    m_layouts.clear();
+}
+
+} // namespace rhi::vulkan

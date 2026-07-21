@@ -17,5 +17,24 @@ target_link_libraries(fitzel_platform PUBLIC glfw PRIVATE fitzel_warnings)
 add_library(fitzel_rhi INTERFACE)
 target_include_directories(fitzel_rhi INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}")
 
+add_library(fitzel_rhi_vulkan STATIC
+    rhi/vulkan/vk_common.cpp
+    rhi/vulkan/vk_swapchain.cpp
+    rhi/vulkan/vk_device.cpp
+    rhi/vulkan/vk_command_list.cpp
+    rhi/vulkan/vk_factory.cpp)
+target_link_libraries(fitzel_rhi_vulkan
+    PUBLIC  fitzel_rhi
+    PRIVATE volk
+            GPUOpen::VulkanMemoryAllocator
+            vk-bootstrap::vk-bootstrap
+            glfw
+            fitzel_warnings)
+# volk owns every entry point, so VMA must resolve its own through the two
+# loader functions it is handed at allocator creation.
+target_compile_definitions(fitzel_rhi_vulkan PRIVATE
+    VMA_STATIC_VULKAN_FUNCTIONS=0
+    VMA_DYNAMIC_VULKAN_FUNCTIONS=1)
+
 add_executable(fitzel main.cpp)
-target_link_libraries(fitzel PRIVATE fitzel_platform fitzel_rhi fitzel_warnings)
+target_link_libraries(fitzel PRIVATE fitzel_platform fitzel_rhi fitzel_rhi_vulkan fitzel_warnings)
