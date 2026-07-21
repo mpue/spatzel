@@ -54,8 +54,23 @@ Application::Application(const AppConfig& config)
 
     m_shader = m_device->createShader("raymarch");
 
-    constexpr std::array<rhi::BindingDesc, 1> bindings{
-        rhi::BindingDesc{.slot = 0, .type = rhi::BindingType::StorageTexture}};
+    // The scene lives in a storage buffer and is uploaded once. Slot 0 is the
+    // render target, slot 1 the edit list.
+    m_scene = buildScene();
+    m_sceneBuffer = m_device->createBuffer({
+        .size      = m_scene.size() * sizeof(GpuPrimitive),
+        .usage     = rhi::BufferUsage::Storage,
+        .access    = rhi::MemoryAccess::CpuToGpu,
+        .debugName = "scene_primitives",
+    });
+    m_device->updateBuffer(
+        m_sceneBuffer,
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(m_scene.data()),
+                                   m_scene.size() * sizeof(GpuPrimitive)));
+
+    constexpr std::array<rhi::BindingDesc, 2> bindings{
+        rhi::BindingDesc{.slot = 0, .type = rhi::BindingType::StorageTexture},
+        rhi::BindingDesc{.slot = 1, .type = rhi::BindingType::StorageBuffer}};
     m_pipeline = m_device->createComputePipeline({
         .cs               = m_shader,
         .pushConstantSize = sizeof(SceneUniforms),
@@ -70,6 +85,9 @@ Application::~Application() {
     // No idle wait: destruction is safe to request at any time, and a backend
     // that can still have work in flight defers the release itself.
     destroyRenderTarget();
+    if (rhi::isValid(m_sceneBuffer)) {
+        m_device->destroy(m_sceneBuffer);
+    }
     if (rhi::isValid(m_pipeline)) {
         m_device->destroy(m_pipeline);
     }
@@ -181,11 +199,12 @@ void Application::renderFrame() {
         .cameraForward  = {forward.x, forward.y, forward.z, 0.0f},
         .resolution     = {static_cast<float>(m_targetExtent.width),
                            static_cast<float>(m_targetExtent.height)},
-        .primitiveCount = 0,
+        .primitiveCount = static_cast<int32_t>(m_scene.size()),
     };
 
     cmd.bindComputePipeline(m_pipeline);
     cmd.bindStorageTexture(0, m_renderTarget);
+    cmd.bindStorageBuffer(1, m_sceneBuffer);
     cmd.pushConstants(asBytes(uniforms));
     cmd.dispatch(divideRoundUp(m_targetExtent.width, kWorkgroupSize),
                  divideRoundUp(m_targetExtent.height, kWorkgroupSize), 1);

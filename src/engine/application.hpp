@@ -3,6 +3,7 @@
 // Engine layer. Sees rhi.hpp and the platform layer — never a backend.
 
 #include "engine/camera.hpp"
+#include "engine/scene.hpp"
 #include "platform/window.hpp"
 #include "rhi/rhi.hpp"
 
@@ -77,6 +78,12 @@ private:
     rhi::PipelineHandle m_pipeline     = rhi::PipelineHandle::Invalid;
     rhi::TextureHandle  m_renderTarget = rhi::TextureHandle::Invalid;
     rhi::Extent2D       m_targetExtent = {};
+
+    // The edit list and its GPU mirror. Uploaded once: the scene is static for
+    // this milestone, and re-uploading is what an editor would add, not the
+    // renderer.
+    std::vector<GpuPrimitive> m_scene;
+    rhi::BufferHandle         m_sceneBuffer = rhi::BufferHandle::Invalid;
 
     FlyCamera m_camera;
     double    m_lastFrameTime = 0.0;

@@ -68,7 +68,8 @@ endif()
 
 add_library(fitzel_engine STATIC
     engine/application.cpp
-    engine/camera.cpp)
+    engine/camera.cpp
+    engine/scene.cpp)
 target_link_libraries(fitzel_engine
     PUBLIC  fitzel_rhi fitzel_platform
     PRIVATE fitzel_warnings)
