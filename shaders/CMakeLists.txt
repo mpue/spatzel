@@ -1,5 +1,5 @@
 set(FITZEL_SHADER_SOURCES
-    "${CMAKE_CURRENT_SOURCE_DIR}/raymarch_probe.comp")
+    "${CMAKE_CURRENT_SOURCE_DIR}/raymarch.comp")
 
 if(FITZEL_WITH_VULKAN)
     fitzel_add_shaders(fitzel_shaders_vulkan

@@ -2,6 +2,7 @@
 
 // Engine layer. Sees rhi.hpp and the platform layer — never a backend.
 
+#include "engine/camera.hpp"
 #include "platform/window.hpp"
 #include "rhi/rhi.hpp"
 
@@ -52,11 +53,21 @@ private:
     void               writeDump(const std::filesystem::path& path);
     [[nodiscard]] bool compareAgainst(const std::filesystem::path& path);
 
-    // Mirrors the push constant block in shaders/raymarch_probe.comp.
-    struct ProbePushConstants {
-        float resolution[2] = {0.0f, 0.0f};
-        float time          = 0.0f;
+    // Mirrors the push constant block in shaders/raymarch.comp.
+    //
+    // Every vector is a vec4 with a scalar tucked into .w. std140 aligns a
+    // vec3 to 16 bytes anyway, so this costs nothing and removes any chance of
+    // the two shader variants disagreeing about offsets.
+    struct SceneUniforms {
+        float   cameraPosition[4] = {}; // xyz, w = tan(fovY / 2)
+        float   cameraRight[4]    = {}; // xyz, w = aspect ratio
+        float   cameraUp[4]       = {}; // xyz, w = time
+        float   cameraForward[4]  = {}; // xyz
+        float   resolution[2]     = {};
+        int32_t primitiveCount    = 0;
+        float   padding           = 0.0f;
     };
+    static_assert(sizeof(SceneUniforms) == 80, "push constant block must stay under 128 bytes");
 
     platform::Window             m_window;
     std::string                  m_shaderRoot;
@@ -66,6 +77,9 @@ private:
     rhi::PipelineHandle m_pipeline     = rhi::PipelineHandle::Invalid;
     rhi::TextureHandle  m_renderTarget = rhi::TextureHandle::Invalid;
     rhi::Extent2D       m_targetExtent = {};
+
+    FlyCamera m_camera;
+    double    m_lastFrameTime = 0.0;
 
     uint64_t m_maxFrames   = 0;
     uint64_t m_framesDrawn = 0;

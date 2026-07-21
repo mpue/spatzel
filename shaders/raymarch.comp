@@ -1,0 +1,55 @@
+#version 450 core
+
+// SDF raymarcher. One source, two targets: the bodies below are identical and
+// only the way resources reach the shader differs, because Vulkan GLSL and
+// OpenGL GLSL disagree about that and nothing above the RHI seam may care.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+#ifdef TARGET_VULKAN
+layout(set = 0, binding = 0, rgba16f) uniform writeonly image2D uOutput;
+layout(push_constant) uniform Uniforms {
+    vec4  cameraPosition; // xyz, w = tan(fovY / 2)
+    vec4  cameraRight;    // xyz, w = aspect
+    vec4  cameraUp;       // xyz, w = time
+    vec4  cameraForward;  // xyz
+    vec2  resolution;
+    int   primitiveCount;
+    float padding;
+} u;
+#else
+// OpenGL has no push constants. The backend maps the same byte blob onto a
+// uniform block; std140 and the push constant layout agree here because every
+// member is a vec4 or sits in the tightly packed 16-byte tail.
+layout(binding = 0, rgba16f) uniform writeonly image2D uOutput;
+layout(binding = 0, std140) uniform Uniforms {
+    vec4  cameraPosition;
+    vec4  cameraRight;
+    vec4  cameraUp;
+    vec4  cameraForward;
+    vec2  resolution;
+    int   primitiveCount;
+    float padding;
+} u;
+#endif
+
+void main() {
+    const ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    if (texel.x >= int(u.resolution.x) || texel.y >= int(u.resolution.y)) {
+        return;
+    }
+
+    // Normalised device coordinates, y flipped: the seam puts texel (0, 0) at
+    // the top-left, while the camera's up axis points the other way.
+    vec2 ndc = ((vec2(texel) + 0.5) / u.resolution) * 2.0 - 1.0;
+    ndc.y = -ndc.y;
+
+    const float tanHalfFov = u.cameraPosition.w;
+    const float aspect     = u.cameraRight.w;
+
+    const vec3 rayDirection = normalize(u.cameraForward.xyz +
+                                        u.cameraRight.xyz * (ndc.x * aspect * tanHalfFov) +
+                                        u.cameraUp.xyz * (ndc.y * tanHalfFov));
+
+    imageStore(uOutput, texel, vec4(rayDirection * 0.5 + 0.5, 1.0));
+}

@@ -52,15 +52,15 @@ Application::Application(const AppConfig& config)
                                      .shaderRoot         = m_shaderRoot.c_str(),
                                  });
 
-    m_shader = m_device->createShader("raymarch_probe");
+    m_shader = m_device->createShader("raymarch");
 
     constexpr std::array<rhi::BindingDesc, 1> bindings{
         rhi::BindingDesc{.slot = 0, .type = rhi::BindingType::StorageTexture}};
     m_pipeline = m_device->createComputePipeline({
         .cs               = m_shader,
-        .pushConstantSize = sizeof(ProbePushConstants),
+        .pushConstantSize = sizeof(SceneUniforms),
         .bindings         = bindings,
-        .debugName        = "raymarch_probe",
+        .debugName        = "raymarch",
     });
 
     resizeRenderTarget(m_device->swapchainExtent());
@@ -120,7 +120,21 @@ bool Application::run() {
         if (m_window.isMinimised()) {
             // Nothing to present into; idle instead of spinning.
             m_window.waitEvents();
+            m_lastFrameTime = platform::timeSeconds();
             continue;
+        }
+
+        const double now = platform::timeSeconds();
+        // Clamped so a stall — a breakpoint, a swapchain rebuild — cannot
+        // teleport the camera across the scene on the frame after it.
+        const float deltaSeconds =
+            std::clamp(static_cast<float>(now - m_lastFrameTime), 0.0f, 0.1f);
+        m_lastFrameTime = now;
+
+        // A pinned run has to be reproducible, and a free-flying camera is
+        // not. Same reasoning as the pinned clock.
+        if (!m_pinTime) {
+            m_camera.update(m_window.input(), deltaSeconds);
         }
 
         renderFrame();
@@ -151,15 +165,28 @@ void Application::renderFrame() {
     // recording is fine: destruction is deferred past the frames in flight.
     resizeRenderTarget(m_device->swapchainExtent());
 
-    const ProbePushConstants push{
-        .resolution = {static_cast<float>(m_targetExtent.width),
-                       static_cast<float>(m_targetExtent.height)},
-        .time = m_pinTime ? m_fixedTime : static_cast<float>(platform::timeSeconds()),
+    const Vec3  position = m_camera.position();
+    const Vec3  right    = m_camera.right();
+    const Vec3  up       = m_camera.up();
+    const Vec3  forward  = m_camera.forward();
+    const float aspect   = static_cast<float>(m_targetExtent.width) /
+                         static_cast<float>(m_targetExtent.height);
+
+    const SceneUniforms uniforms{
+        .cameraPosition = {position.x, position.y, position.z,
+                           std::tan(m_camera.verticalFovRadians() * 0.5f)},
+        .cameraRight    = {right.x, right.y, right.z, aspect},
+        .cameraUp       = {up.x, up.y, up.z,
+                           m_pinTime ? m_fixedTime : static_cast<float>(platform::timeSeconds())},
+        .cameraForward  = {forward.x, forward.y, forward.z, 0.0f},
+        .resolution     = {static_cast<float>(m_targetExtent.width),
+                           static_cast<float>(m_targetExtent.height)},
+        .primitiveCount = 0,
     };
 
     cmd.bindComputePipeline(m_pipeline);
     cmd.bindStorageTexture(0, m_renderTarget);
-    cmd.pushConstants(asBytes(push));
+    cmd.pushConstants(asBytes(uniforms));
     cmd.dispatch(divideRoundUp(m_targetExtent.width, kWorkgroupSize),
                  divideRoundUp(m_targetExtent.height, kWorkgroupSize), 1);
     cmd.blitToSwapchain(m_renderTarget);
