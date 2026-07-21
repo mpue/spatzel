@@ -84,8 +84,12 @@ target_compile_definitions(volk PUBLIC VK_NO_PROTOTYPES)
 # ---------------------------------------------------------------------------
 # Project targets
 # ---------------------------------------------------------------------------
-add_subdirectory(src)
+# Included here rather than in shaders/ so the helper functions are visible to
+# every subdirectory.
+include(CompileShaders)
+
 add_subdirectory(shaders)
+add_subdirectory(src)
 
 # ---------------------------------------------------------------------------
 # RHI seam enforcement — everything above the backend boundary must be free of

@@ -36,5 +36,14 @@ target_compile_definitions(fitzel_rhi_vulkan PRIVATE
     VMA_STATIC_VULKAN_FUNCTIONS=0
     VMA_DYNAMIC_VULKAN_FUNCTIONS=1)
 
+# Note the absence of fitzel_rhi_vulkan here: the engine cannot see the backend
+# even if it wanted to.
+add_library(fitzel_engine STATIC
+    engine/application.cpp)
+target_link_libraries(fitzel_engine
+    PUBLIC  fitzel_rhi fitzel_platform
+    PRIVATE fitzel_warnings)
+
 add_executable(fitzel main.cpp)
-target_link_libraries(fitzel PRIVATE fitzel_platform fitzel_rhi fitzel_rhi_vulkan fitzel_warnings)
+target_link_libraries(fitzel PRIVATE fitzel_engine fitzel_rhi_vulkan fitzel_warnings)
+fitzel_stage_shaders(fitzel fitzel_shaders)
