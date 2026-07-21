@@ -2,6 +2,13 @@
 
 // Platform layer — windowing, input and timing. Contains no graphics API code
 // of any kind; the RHI backend receives only an opaque native handle from here.
+//
+// It does depend on rhi.hpp, for one reason: a client-API context has to exist
+// from the moment the window is created and cannot be attached later. The
+// backend states its requirements, this layer executes them, and neither side
+// learns anything about the other.
+
+#include "rhi/rhi.hpp"
 
 #include <cstdint>
 #include <string>
@@ -16,9 +23,10 @@ struct Extent2D {
 };
 
 struct WindowDesc {
-    uint32_t    width  = 1280;
-    uint32_t    height = 720;
-    std::string title  = "fitzel";
+    uint32_t                width  = 1280;
+    uint32_t                height = 720;
+    std::string             title  = "fitzel";
+    rhi::WindowRequirements graphics{};
 };
 
 enum class Key {

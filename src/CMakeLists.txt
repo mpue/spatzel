@@ -1,43 +1,71 @@
 # Target layout mirrors the architecture:
 #
-#   fitzel_platform    windowing/input/timing        (glfw only)
+#   fitzel_platform    windowing/input/timing        (glfw + rhi.hpp, no backend)
 #   fitzel_rhi         the seam, header-only         (no dependencies at all)
-#   fitzel_rhi_vulkan  the only Vulkan-aware target  (volk, VMA, vk-bootstrap)
-#   fitzel_engine      frame orchestration           (rhi + platform, NOT the backend)
-#   fitzel             executable, links a backend in
+#   fitzel_rhi_vulkan  Vulkan-aware target           (volk, VMA, vk-bootstrap)
+#   fitzel_rhi_opengl  GL-aware target               (glad)
+#   fitzel_rhi_factory backend registry              (rhi.hpp + backend headers)
+#   fitzel_engine      frame orchestration           (rhi + platform, NO backend)
+#   fitzel             executable, links the registry
 #
-# fitzel_engine deliberately does not link fitzel_rhi_vulkan. Swapping backends
-# is an edit to the executable's link line plus one enum value.
-
-add_library(fitzel_platform STATIC
-    platform/window.cpp)
-target_include_directories(fitzel_platform PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(fitzel_platform PUBLIC glfw PRIVATE fitzel_warnings)
+# fitzel_engine deliberately links no backend. The registry is the only place
+# outside src/rhi/<backend>/ that names one, and it does so through headers
+# that contain no graphics API symbols.
 
 add_library(fitzel_rhi INTERFACE)
 target_include_directories(fitzel_rhi INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}")
 
-add_library(fitzel_rhi_vulkan STATIC
-    rhi/vulkan/vk_common.cpp
-    rhi/vulkan/vk_swapchain.cpp
-    rhi/vulkan/vk_device.cpp
-    rhi/vulkan/vk_command_list.cpp
-    rhi/vulkan/vk_factory.cpp)
-target_link_libraries(fitzel_rhi_vulkan
-    PUBLIC  fitzel_rhi
-    PRIVATE volk
-            GPUOpen::VulkanMemoryAllocator
-            vk-bootstrap::vk-bootstrap
-            glfw
-            fitzel_warnings)
-# volk owns every entry point, so VMA must resolve its own through the two
-# loader functions it is handed at allocator creation.
-target_compile_definitions(fitzel_rhi_vulkan PRIVATE
-    VMA_STATIC_VULKAN_FUNCTIONS=0
-    VMA_DYNAMIC_VULKAN_FUNCTIONS=1)
+# The platform layer sees rhi.hpp only for rhi::WindowRequirements: a
+# client-API context must exist from window creation onwards and cannot be
+# attached later.
+add_library(fitzel_platform STATIC
+    platform/window.cpp)
+target_include_directories(fitzel_platform PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(fitzel_platform PUBLIC glfw fitzel_rhi PRIVATE fitzel_warnings)
 
-# Note the absence of fitzel_rhi_vulkan here: the engine cannot see the backend
-# even if it wanted to.
+add_library(fitzel_rhi_factory STATIC
+    rhi/factory.cpp)
+target_link_libraries(fitzel_rhi_factory PUBLIC fitzel_rhi PRIVATE fitzel_warnings)
+
+if(FITZEL_WITH_VULKAN)
+    add_library(fitzel_rhi_vulkan STATIC
+        rhi/vulkan/vk_common.cpp
+        rhi/vulkan/vk_swapchain.cpp
+        rhi/vulkan/vk_device.cpp
+        rhi/vulkan/vk_command_list.cpp
+        rhi/vulkan/vk_factory.cpp)
+    target_link_libraries(fitzel_rhi_vulkan
+        PUBLIC  fitzel_rhi
+        PRIVATE volk
+                GPUOpen::VulkanMemoryAllocator
+                vk-bootstrap::vk-bootstrap
+                glfw
+                fitzel_warnings)
+    # volk owns every entry point, so VMA must resolve its own through the two
+    # loader functions it is handed at allocator creation.
+    target_compile_definitions(fitzel_rhi_vulkan PRIVATE
+        VMA_STATIC_VULKAN_FUNCTIONS=0
+        VMA_DYNAMIC_VULKAN_FUNCTIONS=1)
+
+    target_link_libraries(fitzel_rhi_factory PRIVATE fitzel_rhi_vulkan)
+    target_compile_definitions(fitzel_rhi_factory PRIVATE FITZEL_WITH_VULKAN)
+endif()
+
+if(FITZEL_WITH_OPENGL)
+    add_library(fitzel_rhi_opengl STATIC
+        rhi/opengl/gl_device.cpp
+        rhi/opengl/gl_command_list.cpp
+        rhi/opengl/gl_factory.cpp)
+    target_link_libraries(fitzel_rhi_opengl
+        PUBLIC  fitzel_rhi
+        PRIVATE fitzel_glad
+                glfw
+                fitzel_warnings)
+
+    target_link_libraries(fitzel_rhi_factory PRIVATE fitzel_rhi_opengl)
+    target_compile_definitions(fitzel_rhi_factory PRIVATE FITZEL_WITH_OPENGL)
+endif()
+
 add_library(fitzel_engine STATIC
     engine/application.cpp)
 target_link_libraries(fitzel_engine
@@ -45,5 +73,11 @@ target_link_libraries(fitzel_engine
     PRIVATE fitzel_warnings)
 
 add_executable(fitzel main.cpp)
-target_link_libraries(fitzel PRIVATE fitzel_engine fitzel_rhi_vulkan fitzel_warnings)
-fitzel_stage_shaders(fitzel fitzel_shaders)
+target_link_libraries(fitzel PRIVATE fitzel_engine fitzel_rhi_factory fitzel_warnings)
+
+if(FITZEL_WITH_VULKAN)
+    fitzel_stage_shaders(fitzel fitzel_shaders_vulkan)
+endif()
+if(FITZEL_WITH_OPENGL)
+    fitzel_stage_shaders(fitzel fitzel_shaders_opengl)
+endif()

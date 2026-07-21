@@ -1,6 +1,9 @@
 #include "engine/application.hpp"
 
+#include <algorithm>
 #include <array>
+#include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -16,26 +19,6 @@ constexpr uint32_t divideRoundUp(uint32_t value, uint32_t divisor) {
     return (value + divisor - 1) / divisor;
 }
 
-std::vector<uint32_t> loadSpirv(const std::filesystem::path& path) {
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    if (!file) {
-        throw std::runtime_error("cannot open SPIR-V module: " + path.string());
-    }
-
-    const std::streamsize byteCount = file.tellg();
-    if (byteCount <= 0 || byteCount % sizeof(uint32_t) != 0) {
-        throw std::runtime_error("not a SPIR-V module (bad size): " + path.string());
-    }
-
-    std::vector<uint32_t> words(static_cast<size_t>(byteCount) / sizeof(uint32_t));
-    file.seekg(0);
-    file.read(reinterpret_cast<char*>(words.data()), byteCount);
-    if (!file) {
-        throw std::runtime_error("short read on SPIR-V module: " + path.string());
-    }
-    return words;
-}
-
 template <typename T>
 std::span<const std::byte> asBytes(const T& value) {
     return std::span<const std::byte>(reinterpret_cast<const std::byte*>(&value), sizeof(T));
@@ -44,21 +27,32 @@ std::span<const std::byte> asBytes(const T& value) {
 } // namespace
 
 Application::Application(const AppConfig& config)
-    : m_window({.width = config.width, .height = config.height, .title = config.title}),
-      m_maxFrames(config.maxFrames) {
+    // The window must be created for whatever the chosen backend needs: a
+    // client-API context cannot be attached after the fact. The engine only
+    // forwards the answer — it never interprets it.
+    : m_window({.width    = config.width,
+                .height   = config.height,
+                .title    = config.title,
+                .graphics = rhi::windowRequirements(config.backend, config.enableDebug)}),
+      m_shaderRoot(config.shaderRoot.string()),
+      m_maxFrames(config.maxFrames),
+      m_dumpPath(config.dumpPath),
+      m_comparePath(config.comparePath),
+      m_pinTime(!config.dumpPath.empty() || !config.comparePath.empty()),
+      m_fixedTime(config.fixedTime),
+      m_tolerance(config.tolerance) {
     const platform::Extent2D framebuffer = m_window.framebufferSize();
 
     m_device = rhi::createDevice(config.backend,
                                  {
                                      .nativeWindowHandle = m_window.nativeHandle(),
                                      .framebufferSize    = {framebuffer.width, framebuffer.height},
-                                     .enableValidation   = config.enableValidation,
+                                     .enableDebug        = config.enableDebug,
                                      .applicationName    = config.title.c_str(),
+                                     .shaderRoot         = m_shaderRoot.c_str(),
                                  });
 
-    const std::vector<uint32_t> spirv =
-        loadSpirv(config.shaderDirectory / "raymarch_probe.comp.spv");
-    m_shader = m_device->createShader(spirv);
+    m_shader = m_device->createShader("raymarch_probe");
 
     constexpr std::array<rhi::BindingDesc, 1> bindings{
         rhi::BindingDesc{.slot = 0, .type = rhi::BindingType::StorageTexture}};
@@ -73,9 +67,8 @@ Application::Application(const AppConfig& config)
 }
 
 Application::~Application() {
-    // The device outlives every resource, but in-flight work must finish
-    // before anything it references goes away.
-    m_device->waitIdle();
+    // No idle wait: destruction is safe to request at any time, and a backend
+    // that can still have work in flight defers the release itself.
     destroyRenderTarget();
     if (rhi::isValid(m_pipeline)) {
         m_device->destroy(m_pipeline);
@@ -83,7 +76,6 @@ Application::~Application() {
     if (rhi::isValid(m_shader)) {
         m_device->destroy(m_shader);
     }
-    m_device->waitIdle();
 }
 
 void Application::resizeRenderTarget(rhi::Extent2D extent) {
@@ -97,7 +89,7 @@ void Application::resizeRenderTarget(rhi::Extent2D extent) {
         .height    = extent.height,
         .depth     = 1,
         .format    = rhi::Format::RGBA16Float,
-        .usage     = rhi::TextureUsage::Storage | rhi::TextureUsage::TransferSrc,
+        .usage     = rhi::TextureUsage::Storage | rhi::TextureUsage::CopySrc,
         .debugName = "probe_target",
     });
     m_targetExtent = extent;
@@ -111,7 +103,7 @@ void Application::destroyRenderTarget() {
     }
 }
 
-void Application::run() {
+bool Application::run() {
     while (!m_window.shouldClose()) {
         m_window.pollEvents();
 
@@ -138,6 +130,17 @@ void Application::run() {
             m_window.requestClose();
         }
     }
+
+    if (m_framesDrawn == 0) {
+        return true;
+    }
+    if (!m_dumpPath.empty()) {
+        writeDump(m_dumpPath);
+    }
+    if (!m_comparePath.empty()) {
+        return compareAgainst(m_comparePath);
+    }
+    return true;
 }
 
 void Application::renderFrame() {
@@ -151,7 +154,7 @@ void Application::renderFrame() {
     const ProbePushConstants push{
         .resolution = {static_cast<float>(m_targetExtent.width),
                        static_cast<float>(m_targetExtent.height)},
-        .time       = static_cast<float>(platform::timeSeconds()),
+        .time = m_pinTime ? m_fixedTime : static_cast<float>(platform::timeSeconds()),
     };
 
     cmd.bindComputePipeline(m_pipeline);
@@ -162,6 +165,94 @@ void Application::renderFrame() {
     cmd.blitToSwapchain(m_renderTarget);
 
     m_device->endFrame();
+}
+
+// ---------------------------------------------------------------------------
+// Verification
+//
+// The dump is a deliberately dumb container: magic, extent, linear RGBA
+// floats. It exists so two backends can be diffed against each other, and as
+// the starting point for golden-image tests later.
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr char kDumpMagic[4] = {'F', 'Z', 'L', 'D'};
+
+struct DumpHeader {
+    char     magic[4]{};
+    uint32_t width  = 0;
+    uint32_t height = 0;
+};
+
+} // namespace
+
+void Application::writeDump(const std::filesystem::path& path) {
+    std::vector<float> pixels(static_cast<size_t>(m_targetExtent.width) * m_targetExtent.height * 4);
+    m_device->readTexture(m_renderTarget, pixels);
+
+    DumpHeader header{};
+    std::memcpy(header.magic, kDumpMagic, sizeof(kDumpMagic));
+    header.width  = m_targetExtent.width;
+    header.height = m_targetExtent.height;
+
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file) {
+        throw std::runtime_error("cannot write dump: " + path.string());
+    }
+    file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+    file.write(reinterpret_cast<const char*>(pixels.data()),
+               static_cast<std::streamsize>(pixels.size() * sizeof(float)));
+    if (!file) {
+        throw std::runtime_error("short write on dump: " + path.string());
+    }
+    std::fprintf(stderr, "[engine] wrote %ux%u dump to %s\n", header.width, header.height,
+                 path.string().c_str());
+}
+
+bool Application::compareAgainst(const std::filesystem::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        throw std::runtime_error("cannot read reference: " + path.string());
+    }
+
+    DumpHeader header{};
+    file.read(reinterpret_cast<char*>(&header), sizeof(header));
+    if (!file || std::memcmp(header.magic, kDumpMagic, sizeof(kDumpMagic)) != 0) {
+        throw std::runtime_error("not a fitzel dump: " + path.string());
+    }
+    if (header.width != m_targetExtent.width || header.height != m_targetExtent.height) {
+        std::fprintf(stderr, "[compare] FAIL: reference is %ux%u, this run is %ux%u\n",
+                     header.width, header.height, m_targetExtent.width, m_targetExtent.height);
+        return false;
+    }
+
+    const size_t       count = static_cast<size_t>(header.width) * header.height * 4;
+    std::vector<float> reference(count);
+    file.read(reinterpret_cast<char*>(reference.data()),
+              static_cast<std::streamsize>(count * sizeof(float)));
+    if (!file) {
+        throw std::runtime_error("truncated reference: " + path.string());
+    }
+
+    std::vector<float> actual(count);
+    m_device->readTexture(m_renderTarget, actual);
+
+    float  maxDiff  = 0.0f;
+    double sumDiff  = 0.0;
+    size_t overCount = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const float diff = std::abs(actual[i] - reference[i]);
+        maxDiff = std::max(maxDiff, diff);
+        sumDiff += diff;
+        overCount += diff > m_tolerance ? 1 : 0;
+    }
+
+    const bool passed = maxDiff <= m_tolerance;
+    std::fprintf(stderr,
+                 "[compare] %s — max %.6f, mean %.6f, %zu/%zu components over tolerance %.6f\n",
+                 passed ? "PASS" : "FAIL", static_cast<double>(maxDiff), sumDiff / double(count),
+                 overCount, count, static_cast<double>(m_tolerance));
+    return passed;
 }
 
 } // namespace engine

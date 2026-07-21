@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string_view>
 #include <type_traits>
 
 namespace rhi {
@@ -35,7 +36,33 @@ template <typename H>
     return handle != H::Invalid;
 }
 
-enum class Backend : uint8_t { Vulkan };
+enum class Backend : uint8_t { Vulkan, OpenGL };
+
+// True if this binary was linked with an implementation of `backend`.
+[[nodiscard]] bool isBackendAvailable(Backend backend);
+
+// ---------------------------------------------------------------------------
+// Window requirements
+//
+// Some APIs need the window to be created a particular way — a client-API
+// context has to exist before the device does, and cannot be attached
+// afterwards. So the backend states what it needs and the platform layer
+// executes it. The platform layer never learns which backend asked.
+// ---------------------------------------------------------------------------
+enum class ClientApi : uint8_t {
+    None,       // the backend creates its own presentation surface
+    OpenGLCore, // the window must own a core-profile context of the given version
+};
+
+struct WindowRequirements {
+    ClientApi api          = ClientApi::None;
+    uint32_t  majorVersion = 0;
+    uint32_t  minorVersion = 0;
+    bool      debugContext = false;
+};
+
+// Must be answerable before a device — or even a window — exists.
+[[nodiscard]] WindowRequirements windowRequirements(Backend backend, bool enableDebug);
 
 // ---------------------------------------------------------------------------
 // Enums
@@ -58,16 +85,16 @@ enum class BufferUsage : uint32_t {
     None        = 0,
     Storage     = 1u << 0,
     Uniform     = 1u << 1,
-    TransferSrc = 1u << 2,
-    TransferDst = 1u << 3,
+    CopySrc     = 1u << 2,
+    CopyDst     = 1u << 3,
 };
 
 enum class TextureUsage : uint32_t {
     None        = 0,
     Storage     = 1u << 0,
     Sampled     = 1u << 1,
-    TransferSrc = 1u << 2,
-    TransferDst = 1u << 3,
+    CopySrc     = 1u << 2,
+    CopyDst     = 1u << 3,
 };
 
 // Opt-in bitmask operators.
@@ -101,6 +128,18 @@ struct Extent2D {
 
     friend bool operator==(const Extent2D&, const Extent2D&) = default;
 };
+
+// Texel (0, 0) is the TOP-LEFT corner of a texture, and of the presented
+// image. This is a contract, not an observation: a backend whose presentation
+// surface disagrees flips on its own side of the seam. Without it, two
+// backends running the same shader differ by a vertical mirror.
+inline constexpr bool kTopLeftOrigin = true;
+
+// Presentation applies no colour space conversion: whatever a render target
+// holds is what reaches the screen. A backend whose natural presentation
+// surface would encode on the way out must choose one that does not.
+// Like the origin above, this only shows up when a second backend disagrees.
+inline constexpr bool kPresentsUnconverted = true;
 
 struct BufferDesc {
     uint64_t     size      = 0;
@@ -173,8 +212,13 @@ struct DeviceCreateInfo {
     // above the seam may interpret it.
     void*       nativeWindowHandle = nullptr;
     Extent2D    framebufferSize    = {};
-    bool        enableValidation   = false;
+    // Enables whatever diagnostics the backend offers — validation layers,
+    // debug message callbacks, object naming.
+    bool        enableDebug        = false;
     const char* applicationName    = "fitzel";
+    // Root directory holding the compiled shader variants. Each backend picks
+    // its own subdirectory; the layout below this path is a backend detail.
+    const char* shaderRoot         = "shaders";
 };
 
 class Device {
@@ -195,19 +239,29 @@ public:
     // full-screen render target.
     [[nodiscard]] virtual Extent2D swapchainExtent() const = 0;
 
-    // Blocks until the device is idle. Required before destroying resources
-    // that may still be referenced by in-flight work.
-    virtual void waitIdle() = 0;
-
     // --- Resources ---------------------------------------------------------
+    //
+    // Destruction is always safe to request: a backend that can still have the
+    // resource in flight defers the actual release itself. There is
+    // deliberately no way to ask the device to go idle — that is a
+    // synchronisation model, and synchronisation models differ per backend.
     [[nodiscard]] virtual TextureHandle  createTexture(const TextureDesc& desc)          = 0;
     [[nodiscard]] virtual BufferHandle   createBuffer(const BufferDesc& desc)            = 0;
-    [[nodiscard]] virtual ShaderHandle   createShader(std::span<const uint32_t> spirv)   = 0;
     [[nodiscard]] virtual PipelineHandle createComputePipeline(const ComputePipelineDesc& desc) = 0;
+
+    // Shaders are referenced by logical name, never by compiled bytes: the
+    // same GLSL yields different binaries per backend, and choosing between
+    // them is not a decision the engine can make correctly.
+    [[nodiscard]] virtual ShaderHandle createShader(std::string_view logicalName) = 0;
 
     // Host-visible buffers only (MemoryAccess::CpuToGpu).
     virtual void updateBuffer(BufferHandle buffer, std::span<const std::byte> data,
                               uint64_t offset = 0) = 0;
+
+    // Blocking read of a texture's contents as linear RGBA floats, row-major
+    // from the top-left texel. `out` must hold width * height * 4 values.
+    // Intended for verification, not for a rendering path.
+    virtual void readTexture(TextureHandle texture, std::span<float> out) = 0;
 
     virtual void destroy(TextureHandle handle)  = 0;
     virtual void destroy(BufferHandle handle)   = 0;

@@ -11,8 +11,10 @@
 
 #include <array>
 #include <cstddef>
+#include <filesystem>
 #include <functional>
 #include <memory>
+#include <string_view>
 #include <vector>
 
 namespace rhi::vulkan {
@@ -72,15 +74,15 @@ public:
     void         endFrame() override;
     void         onResize(uint32_t width, uint32_t height) override;
     Extent2D     swapchainExtent() const override;
-    void         waitIdle() override;
 
     TextureHandle  createTexture(const TextureDesc& desc) override;
     BufferHandle   createBuffer(const BufferDesc& desc) override;
-    ShaderHandle   createShader(std::span<const uint32_t> spirv) override;
+    ShaderHandle   createShader(std::string_view logicalName) override;
     PipelineHandle createComputePipeline(const ComputePipelineDesc& desc) override;
 
     void updateBuffer(BufferHandle handle, std::span<const std::byte> data,
                       uint64_t offset) override;
+    void readTexture(TextureHandle handle, std::span<float> out) override;
 
     void destroy(TextureHandle handle) override;
     void destroy(BufferHandle handle) override;
@@ -107,6 +109,10 @@ private:
     void recreateSwapchainIfNeeded();
     void collectGarbage();
     void defer(std::function<void()> deleter);
+
+    // Runs a short command buffer and blocks until it has completed. Used only
+    // by readTexture; the frame path never needs it.
+    void submitBlocking(const std::function<void(VkCommandBuffer)>& record);
 
     // Barrier helpers — the whole reason transitions never surface in rhi.hpp.
     void transitionTexture(VkCommandBuffer cmd, Texture& texture, VkImageLayout layout,
@@ -136,6 +142,9 @@ private:
         std::function<void()> deleter;
     };
     std::vector<PendingDeletion> m_deletionQueue;
+
+    // <shaderRoot>/vulkan — this backend's own SPIR-V variants.
+    std::filesystem::path m_shaderDirectory;
 
     // Producer state of the swapchain image currently being written, so the
     // pre-present barrier knows what it has to wait for.

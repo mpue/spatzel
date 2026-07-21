@@ -5,44 +5,82 @@
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <string_view>
+
+namespace {
+
+void printUsage() {
+    std::fprintf(stderr,
+                 "usage: fitzel [options]\n"
+                 "  --backend <vulkan|opengl>  graphics backend (default: vulkan)\n"
+                 "  --frames <n>               run n frames, then shut down normally\n"
+                 "  --dump <file>              write the final frame for later comparison\n"
+                 "  --compare <file>           compare the final frame against a dump\n"
+                 "  --tolerance <f>            per-component tolerance for --compare\n");
+}
+
+bool parseBackend(std::string_view name, rhi::Backend& out) {
+    // The only place outside the RHI where a backend name is spelled out.
+    if (name == "vulkan") {
+        out = rhi::Backend::Vulkan;
+        return true;
+    }
+    if (name == "opengl") {
+        out = rhi::Backend::OpenGL;
+        return true;
+    }
+    return false;
+}
+
+} // namespace
 
 int main(int argc, char** argv) {
     try {
-        // SPIR-V modules are staged next to the executable by the build.
-        std::filesystem::path shaderDirectory = "shaders";
+        engine::AppConfig config{};
+        config.title = "fitzel";
+#ifndef NDEBUG
+        config.enableDebug = true;
+#endif
+
+        // SPIR-V variants are staged next to the executable by the build.
         if (argc > 0 && argv[0] != nullptr) {
-            shaderDirectory = std::filesystem::absolute(argv[0]).parent_path() / "shaders";
+            config.shaderRoot = std::filesystem::absolute(argv[0]).parent_path() / "shaders";
         }
 
-        // --frames N runs a fixed number of frames and then shuts down
-        // normally, so the whole lifecycle can be exercised unattended.
-        uint64_t maxFrames = 0;
-        for (int i = 1; i + 1 < argc; ++i) {
-            if (std::strcmp(argv[i], "--frames") == 0) {
-                maxFrames = std::strtoull(argv[i + 1], nullptr, 10);
+        for (int i = 1; i < argc; ++i) {
+            const std::string_view arg(argv[i]);
+            const bool             hasValue = i + 1 < argc;
+
+            if (arg == "--backend" && hasValue) {
+                if (!parseBackend(argv[++i], config.backend)) {
+                    std::fprintf(stderr, "unknown backend '%s'\n", argv[i]);
+                    printUsage();
+                    return 2;
+                }
+            } else if (arg == "--frames" && hasValue) {
+                config.maxFrames = std::strtoull(argv[++i], nullptr, 10);
+            } else if (arg == "--dump" && hasValue) {
+                config.dumpPath = argv[++i];
+            } else if (arg == "--compare" && hasValue) {
+                config.comparePath = argv[++i];
+            } else if (arg == "--tolerance" && hasValue) {
+                config.tolerance = std::strtof(argv[++i], nullptr);
+            } else {
+                std::fprintf(stderr, "unrecognised argument '%s'\n", argv[i]);
+                printUsage();
+                return 2;
             }
         }
 
-        engine::AppConfig config{
-            .width  = 1280,
-            .height = 720,
-            .title  = "fitzel",
-            // The only place in engine-level code that names a backend.
-            .backend = rhi::Backend::Vulkan,
-#ifdef NDEBUG
-            .enableValidation = false,
-#else
-            .enableValidation = true,
-#endif
-            .shaderDirectory = shaderDirectory,
-            .maxFrames       = maxFrames,
-        };
+        if (!rhi::isBackendAvailable(config.backend)) {
+            std::fprintf(stderr, "requested backend is not linked into this binary\n");
+            return 2;
+        }
 
         engine::Application app(config);
-        app.run();
+        return app.run() ? 0 : 1;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "fatal: %s\n", e.what());
         return 1;
     }
-    return 0;
 }

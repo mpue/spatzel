@@ -37,9 +37,27 @@ Window::Window(const WindowDesc& desc) {
     }
     ++g_glfwRefCount;
 
-    // No OpenGL context — the surface is owned by the graphics backend.
-    glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+    glfwDefaultWindowHints();
     glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
+
+    // Executed on the backend's behalf. This layer does not know, and must not
+    // know, which backend asked for it.
+    switch (desc.graphics.api) {
+        case rhi::ClientApi::None:
+            // The backend creates its own presentation surface.
+            glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+            break;
+        case rhi::ClientApi::OpenGLCore:
+            glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_API);
+            glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+            glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR,
+                           static_cast<int>(desc.graphics.majorVersion));
+            glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR,
+                           static_cast<int>(desc.graphics.minorVersion));
+            glfwWindowHint(GLFW_OPENGL_DEBUG_CONTEXT,
+                           desc.graphics.debugContext ? GLFW_TRUE : GLFW_FALSE);
+            break;
+    }
 
     GLFWwindow* handle = glfwCreateWindow(static_cast<int>(desc.width),
                                           static_cast<int>(desc.height),

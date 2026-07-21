@@ -31,6 +31,19 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# Backends
+#
+# Which backends exist in the binary is decided here; which one runs is decided
+# at startup by --backend. Turning one off must never break the other.
+# ---------------------------------------------------------------------------
+option(FITZEL_WITH_VULKAN "Build the Vulkan backend" ON)
+option(FITZEL_WITH_OPENGL "Build the OpenGL backend" ON)
+
+if(NOT FITZEL_WITH_VULKAN AND NOT FITZEL_WITH_OPENGL)
+    message(FATAL_ERROR "At least one backend must be enabled.")
+endif()
+
+# ---------------------------------------------------------------------------
 # Dependencies
 # ---------------------------------------------------------------------------
 include(FetchContent)
@@ -69,17 +82,33 @@ FetchContent_Declare(vk_bootstrap
     GIT_TAG        v1.4.350
     GIT_SHALLOW    ON)
 
-FetchContent_MakeAvailable(vulkan_headers glfw)
+FetchContent_Declare(glad
+    GIT_REPOSITORY https://github.com/Dav1dde/glad.git
+    GIT_TAG        v2.0.8
+    GIT_SHALLOW    ON
+    SOURCE_SUBDIR  cmake)
 
-# volk and vk-bootstrap resolve Vulkan headers through these.
-set(VOLK_PULL_IN_VULKAN OFF CACHE BOOL "" FORCE)
-set(VK_BOOTSTRAP_TEST   OFF CACHE BOOL "" FORCE)
-set(VK_BOOTSTRAP_WERROR OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(glfw)
 
-FetchContent_MakeAvailable(volk vma vk_bootstrap)
+if(FITZEL_WITH_VULKAN)
+    FetchContent_MakeAvailable(vulkan_headers)
 
-target_link_libraries(volk PUBLIC Vulkan::Headers)
-target_compile_definitions(volk PUBLIC VK_NO_PROTOTYPES)
+    # volk and vk-bootstrap resolve Vulkan headers through these.
+    set(VOLK_PULL_IN_VULKAN OFF CACHE BOOL "" FORCE)
+    set(VK_BOOTSTRAP_TEST   OFF CACHE BOOL "" FORCE)
+    set(VK_BOOTSTRAP_WERROR OFF CACHE BOOL "" FORCE)
+
+    FetchContent_MakeAvailable(volk vma vk_bootstrap)
+
+    target_link_libraries(volk PUBLIC Vulkan::Headers)
+    target_compile_definitions(volk PUBLIC VK_NO_PROTOTYPES)
+endif()
+
+if(FITZEL_WITH_OPENGL)
+    # glad2 generates its loader at configure time (needs Python 3).
+    FetchContent_MakeAvailable(glad)
+    glad_add_library(fitzel_glad REPRODUCIBLE API gl:core=4.6)
+endif()
 
 # ---------------------------------------------------------------------------
 # Project targets

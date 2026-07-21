@@ -6,6 +6,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 
@@ -29,6 +30,58 @@ VkBool32 VKAPI_PTR debugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT severity
     return VK_FALSE;
 }
 
+std::vector<uint32_t> loadSpirv(const std::filesystem::path& path) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) {
+        throw std::runtime_error("cannot open SPIR-V module: " + path.string());
+    }
+
+    const std::streamsize byteCount = file.tellg();
+    if (byteCount <= 0 || byteCount % sizeof(uint32_t) != 0) {
+        throw std::runtime_error("not a SPIR-V module (bad size): " + path.string());
+    }
+
+    std::vector<uint32_t> words(static_cast<size_t>(byteCount) / sizeof(uint32_t));
+    file.seekg(0);
+    file.read(reinterpret_cast<char*>(words.data()), byteCount);
+    if (!file) {
+        throw std::runtime_error("short read on SPIR-V module: " + path.string());
+    }
+    return words;
+}
+
+// Half-precision floats only appear here, in the readback path: the storage
+// image is RGBA16F and the seam speaks plain floats.
+float halfToFloat(uint16_t bits) {
+    const uint32_t sign     = static_cast<uint32_t>(bits >> 15) << 31;
+    const uint32_t exponent = (bits >> 10) & 0x1Fu;
+    const uint32_t mantissa = bits & 0x3FFu;
+
+    uint32_t result = 0;
+    if (exponent == 0) {
+        if (mantissa != 0) {
+            // Subnormal: renormalise into a regular single-precision value.
+            uint32_t shifted  = mantissa;
+            uint32_t exponent32 = 127 - 15 + 1;
+            while ((shifted & 0x400u) == 0) {
+                shifted <<= 1;
+                --exponent32;
+            }
+            shifted &= 0x3FFu;
+            result = (exponent32 << 23) | (shifted << 13);
+        }
+    } else if (exponent == 0x1Fu) {
+        result = (0xFFu << 23) | (mantissa << 13);
+    } else {
+        result = ((exponent - 15 + 127) << 23) | (mantissa << 13);
+    }
+    result |= sign;
+
+    float value = 0.0f;
+    std::memcpy(&value, &result, sizeof(value));
+    return value;
+}
+
 void initialiseLoaderOnce() {
     static const bool initialised = [] {
         checkResult(volkInitialize(), "volkInitialize");
@@ -44,6 +97,8 @@ void initialiseLoaderOnce() {
 // ---------------------------------------------------------------------------
 VulkanDevice::VulkanDevice(const DeviceCreateInfo& info) : m_commandList(*this) {
     m_windowExtent = {info.framebufferSize.width, info.framebufferSize.height};
+    // The layout below shaderRoot is this backend's business alone.
+    m_shaderDirectory = std::filesystem::path(info.shaderRoot) / "vulkan";
 
     initialiseLoaderOnce();
     createInstance(info);
@@ -67,7 +122,7 @@ void VulkanDevice::createInstance(const DeviceCreateInfo& info) {
         .require_api_version(1, 3, 0)
         .enable_extensions(extensionCount, extensions);
 
-    if (info.enableValidation) {
+    if (info.enableDebug) {
         builder.request_validation_layers(true).set_debug_callback(&debugCallback);
     }
 
@@ -384,14 +439,6 @@ Extent2D VulkanDevice::swapchainExtent() const {
     return {extent.width, extent.height};
 }
 
-void VulkanDevice::waitIdle() {
-    FITZEL_CHECK(vkDeviceWaitIdle(m_device.device));
-    for (PendingDeletion& pending : m_deletionQueue) {
-        pending.deleter();
-    }
-    m_deletionQueue.clear();
-}
-
 void VulkanDevice::recreateSwapchainIfNeeded() {
     if (!m_swapchainDirty || m_windowExtent.width == 0 || m_windowExtent.height == 0) {
         return;
@@ -590,10 +637,12 @@ BufferHandle VulkanDevice::createBuffer(const BufferDesc& desc) {
     return m_buffers.insert(buffer);
 }
 
-ShaderHandle VulkanDevice::createShader(std::span<const uint32_t> spirv) {
-    if (spirv.empty()) {
-        throw std::runtime_error("rhi: createShader with empty SPIR-V");
-    }
+ShaderHandle VulkanDevice::createShader(std::string_view logicalName) {
+    // Only compute exists so far, hence the fixed stage suffix. The engine
+    // never sees any of this — it asked for "raymarch_probe".
+    const std::filesystem::path path =
+        m_shaderDirectory / (std::string(logicalName) + ".comp.spv");
+    const std::vector<uint32_t> spirv = loadSpirv(path);
 
     const VkShaderModuleCreateInfo info{
         .sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
@@ -698,6 +747,127 @@ void VulkanDevice::updateBuffer(BufferHandle handle, std::span<const std::byte> 
     auto* destination = static_cast<std::byte*>(buffer.info.pMappedData) + offset;
     std::memcpy(destination, data.data(), data.size());
     FITZEL_CHECK(vmaFlushAllocation(m_allocator, buffer.allocation, offset, data.size()));
+}
+
+void VulkanDevice::submitBlocking(const std::function<void(VkCommandBuffer)>& record) {
+    const VkCommandPoolCreateInfo poolInfo{
+        .sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .pNext            = nullptr,
+        .flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+        .queueFamilyIndex = m_queueFamily,
+    };
+    VkCommandPool pool = VK_NULL_HANDLE;
+    FITZEL_CHECK(vkCreateCommandPool(m_device.device, &poolInfo, nullptr, &pool));
+
+    const VkCommandBufferAllocateInfo allocInfo{
+        .sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .pNext              = nullptr,
+        .commandPool        = pool,
+        .level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    FITZEL_CHECK(vkAllocateCommandBuffers(m_device.device, &allocInfo, &cmd));
+
+    const VkCommandBufferBeginInfo beginInfo{
+        .sType            = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .pNext            = nullptr,
+        .flags            = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        .pInheritanceInfo = nullptr,
+    };
+    FITZEL_CHECK(vkBeginCommandBuffer(cmd, &beginInfo));
+    record(cmd);
+    FITZEL_CHECK(vkEndCommandBuffer(cmd));
+
+    const VkCommandBufferSubmitInfo commandInfo{
+        .sType         = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+        .pNext         = nullptr,
+        .commandBuffer = cmd,
+        .deviceMask    = 0,
+    };
+    const VkSubmitInfo2 submitInfo{
+        .sType                    = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+        .pNext                    = nullptr,
+        .flags                    = 0,
+        .waitSemaphoreInfoCount   = 0,
+        .pWaitSemaphoreInfos      = nullptr,
+        .commandBufferInfoCount   = 1,
+        .pCommandBufferInfos      = &commandInfo,
+        .signalSemaphoreInfoCount = 0,
+        .pSignalSemaphoreInfos    = nullptr,
+    };
+
+    const VkFenceCreateInfo fenceInfo{
+        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .pNext = nullptr, .flags = 0};
+    VkFence fence = VK_NULL_HANDLE;
+    FITZEL_CHECK(vkCreateFence(m_device.device, &fenceInfo, nullptr, &fence));
+
+    FITZEL_CHECK(vkQueueSubmit2(m_queue, 1, &submitInfo, fence));
+    FITZEL_CHECK(vkWaitForFences(m_device.device, 1, &fence, VK_TRUE, UINT64_MAX));
+
+    vkDestroyFence(m_device.device, fence, nullptr);
+    vkDestroyCommandPool(m_device.device, pool, nullptr);
+}
+
+void VulkanDevice::readTexture(TextureHandle handle, std::span<float> out) {
+    Texture& texture = m_textures.get(handle);
+    if (texture.format != VK_FORMAT_R16G16B16A16_SFLOAT) {
+        throw std::runtime_error("rhi: readTexture only supports RGBA16Float for now");
+    }
+
+    const size_t texelCount = static_cast<size_t>(texture.extent.width) * texture.extent.height;
+    if (out.size() < texelCount * 4) {
+        throw std::runtime_error("rhi: readTexture destination is too small");
+    }
+
+    // Everything the frame path may still be doing with this image has to
+    // finish before it can be copied out.
+    FITZEL_CHECK(vkDeviceWaitIdle(m_device.device));
+
+    const VkDeviceSize byteCount = texelCount * 4 * sizeof(uint16_t);
+    const VkBufferCreateInfo bufferInfo{
+        .sType                 = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .pNext                 = nullptr,
+        .flags                 = 0,
+        .size                  = byteCount,
+        .usage                 = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .sharingMode           = VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices   = nullptr,
+    };
+    VmaAllocationCreateInfo allocInfo{};
+    allocInfo.usage = VMA_MEMORY_USAGE_AUTO;
+    allocInfo.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+                      VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+    VkBuffer          staging     = VK_NULL_HANDLE;
+    VmaAllocation     allocation  = VK_NULL_HANDLE;
+    VmaAllocationInfo allocated{};
+    FITZEL_CHECK(
+        vmaCreateBuffer(m_allocator, &bufferInfo, &allocInfo, &staging, &allocation, &allocated));
+
+    submitBlocking([&](VkCommandBuffer cmd) {
+        transitionTexture(cmd, texture, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                          VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        const VkBufferImageCopy region{
+            .bufferOffset      = 0,
+            .bufferRowLength   = 0,
+            .bufferImageHeight = 0,
+            .imageSubresource  = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+            .imageOffset       = {0, 0, 0},
+            .imageExtent       = texture.extent,
+        };
+        vkCmdCopyImageToBuffer(cmd, texture.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging, 1,
+                               &region);
+    });
+
+    FITZEL_CHECK(vmaInvalidateAllocation(m_allocator, allocation, 0, byteCount));
+    const auto* halves = static_cast<const uint16_t*>(allocated.pMappedData);
+    for (size_t i = 0; i < texelCount * 4; ++i) {
+        out[i] = halfToFloat(halves[i]);
+    }
+
+    vmaDestroyBuffer(m_allocator, staging, allocation);
 }
 
 void VulkanDevice::destroy(TextureHandle handle) {

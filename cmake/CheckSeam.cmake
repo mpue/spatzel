@@ -11,18 +11,29 @@ if(NOT DEFINED SEAM_SOURCE_DIR)
     message(FATAL_ERROR "CheckSeam: SEAM_SOURCE_DIR not set")
 endif()
 
-# Everything at or above the seam. src/rhi/vulkan/ is the deliberate exception.
+# Everything at or above the seam. src/rhi/<backend>/ are the only exceptions.
+# The factory and the shared handle pool are scanned too: they sit beside the
+# backends and must stay symbol-free.
 set(SEAM_ROOTS
     "${SEAM_SOURCE_DIR}/src/engine"
     "${SEAM_SOURCE_DIR}/src/platform"
     "${SEAM_SOURCE_DIR}/src/rhi/rhi.hpp"
+    "${SEAM_SOURCE_DIR}/src/rhi/handle_pool.hpp"
+    "${SEAM_SOURCE_DIR}/src/rhi/factory.cpp"
+    "${SEAM_SOURCE_DIR}/src/rhi/vulkan/vk_backend.hpp"
+    "${SEAM_SOURCE_DIR}/src/rhi/opengl/gl_backend.hpp"
     "${SEAM_SOURCE_DIR}/src/main.cpp")
 
-# vk<Upper>  : vkCreateDevice, vkCmdDispatch, ...
-# Vk<Upper>  : VkDevice, VkImage, ...
-# VK_        : VK_SUCCESS, VK_FORMAT_*, VK_NO_PROTOTYPES, ...
-# Vma / vma  : VMA allocator types and functions
-# volk / <vulkan : the headers themselves
+# Vulkan:
+#   vk<Upper>  : vkCreateDevice, vkCmdDispatch, ...
+#   Vk<Upper>  : VkDevice, VkImage, ...
+#   VK_        : VK_SUCCESS, VK_FORMAT_*, VK_NO_PROTOTYPES, ...
+#   Vma / vma  : VMA allocator types and functions
+# OpenGL:
+#   gl<Upper>  : glDispatchCompute, glBindImageTexture, ...
+#   GL_        : GL_RGBA16F, GL_COMPUTE_SHADER, ...
+#   GL<type>   : spelled out, because GL[A-Z] would also match every GLFW_*
+#                constant and GLFW is a windowing library, not a graphics API.
 set(_patterns
     "vk[A-Z]"
     "Vk[A-Z]"
@@ -31,6 +42,11 @@ set(_patterns
     "VMA_"
     "include[ \t]*[<\"]volk"
     "include[ \t]*[<\"]vulkan"
+    "gl[A-Z]"
+    "(^|[^A-Za-z0-9_])GL_"
+    "GL(uint|int|enum|sizei|float|double|bitfield|char|boolean|void|byte|short)"
+    "GLAD"
+    "include[ \t]*[<\"]glad"
 )
 
 set(_violations "")
@@ -64,9 +80,9 @@ if(_violations)
     list(REMOVE_DUPLICATES _violations)
     string(REPLACE ";" "\n" _report "${_violations}")
     message(FATAL_ERROR
-        "RHI seam violated — Vulkan symbols found above the backend boundary:\n"
+        "RHI seam violated — graphics API symbols found above the backend boundary:\n"
         "${_report}\n"
-        "Vulkan may only appear inside src/rhi/vulkan/.")
+        "A graphics API may only appear inside src/rhi/<backend>/.")
 endif()
 
 message(STATUS "RHI seam check: clean")

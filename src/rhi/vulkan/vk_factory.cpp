@@ -1,19 +1,19 @@
-// The bridge between the backend-agnostic interface and this backend. Linking
-// this translation unit is what makes rhi::Backend::Vulkan available; nothing
-// above the seam includes anything from src/rhi/vulkan/.
+// Backend-side half of the factory. rhi::createDevice lives in
+// src/rhi/factory.cpp and dispatches here.
 
+#include "rhi/vulkan/vk_backend.hpp"
 #include "rhi/vulkan/vk_device.hpp"
 
-#include <stdexcept>
+namespace rhi::vulkan {
 
-namespace rhi {
-
-std::unique_ptr<Device> createDevice(Backend backend, const DeviceCreateInfo& info) {
-    switch (backend) {
-        case Backend::Vulkan:
-            return std::make_unique<vulkan::VulkanDevice>(info);
-    }
-    throw std::runtime_error("rhi: requested backend is not linked into this binary");
+WindowRequirements windowRequirements(bool) {
+    // Vulkan owns its presentation surface, so the window must be created
+    // without any client API attached to it.
+    return WindowRequirements{.api = ClientApi::None};
 }
 
-} // namespace rhi
+std::unique_ptr<Device> createDevice(const DeviceCreateInfo& info) {
+    return std::make_unique<VulkanDevice>(info);
+}
+
+} // namespace rhi::vulkan

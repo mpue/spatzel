@@ -1,16 +1,30 @@
-#version 450
+#version 450 core
 
 // Milestone-1 probe pass: proves the compute -> storage image -> present path.
 // Writes an animated UV gradient; no actual raymarching yet.
+//
+// One source, two targets. The bodies are identical; only the way resources
+// reach the shader differs, because Vulkan GLSL and OpenGL GLSL disagree about
+// that and nothing above the RHI seam is allowed to care.
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
+#ifdef TARGET_VULKAN
 layout(set = 0, binding = 0, rgba16f) uniform writeonly image2D uOutput;
-
 layout(push_constant) uniform Push {
     vec2  resolution;
     float time;
 } pc;
+#else
+// OpenGL has no push constants. The backend maps the same byte blob onto a
+// uniform block; std140 places vec2 at offset 0 and float at offset 8, which
+// is exactly the push constant layout above.
+layout(binding = 0, rgba16f) uniform writeonly image2D uOutput;
+layout(binding = 0, std140) uniform Push {
+    vec2  resolution;
+    float time;
+} pc;
+#endif
 
 void main() {
     const ivec2 texel = ivec2(gl_GlobalInvocationID.xy);

@@ -25,6 +25,15 @@ void Swapchain::recreate(VkExtent2D extent) {
 void Swapchain::build(VkExtent2D extent, VkSwapchainKHR oldSwapchain) {
     vkb::SwapchainBuilder builder(m_device);
     builder.set_desired_extent(extent.width, extent.height)
+        // A UNORM surface, deliberately not the SRGB one vk-bootstrap would
+        // pick by default. The seam presents whatever the render target holds,
+        // without a colour space conversion; blitting into an sRGB image would
+        // silently encode on the way out and make this backend disagree with
+        // one that has no such conversion in its present path.
+        .set_desired_format(VkSurfaceFormatKHR{VK_FORMAT_B8G8R8A8_UNORM,
+                                               VK_COLOR_SPACE_SRGB_NONLINEAR_KHR})
+        .add_fallback_format(VkSurfaceFormatKHR{VK_FORMAT_R8G8B8A8_UNORM,
+                                                VK_COLOR_SPACE_SRGB_NONLINEAR_KHR})
         // FIFO is always supported and keeps the loop from spinning.
         .set_desired_present_mode(VK_PRESENT_MODE_FIFO_KHR)
         // The compute result is blitted in, so the image must be a transfer

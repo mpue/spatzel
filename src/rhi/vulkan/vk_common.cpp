@@ -3,7 +3,23 @@
 // VMA_STATIC_VULKAN_FUNCTIONS is off (see the target's compile definitions).
 #define VMA_IMPLEMENTATION
 
+// VMA's implementation lives in this translation unit, so it inherits our
+// warning level. It is third-party code and must not be able to fail the build.
+#if defined(_MSC_VER)
+#pragma warning(push, 0)
+#elif defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wall"
+#pragma GCC diagnostic ignored "-Wextra"
+#endif
+
 #include "rhi/vulkan/vk_common.hpp"
+
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#elif defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 #include <stdexcept>
 #include <string>
@@ -56,8 +72,8 @@ VkBufferUsageFlags toVkBufferUsage(BufferUsage usage) {
     VkBufferUsageFlags flags = 0;
     if (any(usage & BufferUsage::Storage))     flags |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     if (any(usage & BufferUsage::Uniform))     flags |= VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
-    if (any(usage & BufferUsage::TransferSrc)) flags |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    if (any(usage & BufferUsage::TransferDst)) flags |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if (any(usage & BufferUsage::CopySrc))     flags |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    if (any(usage & BufferUsage::CopyDst))     flags |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     return flags;
 }
 
@@ -65,8 +81,8 @@ VkImageUsageFlags toVkImageUsage(TextureUsage usage) {
     VkImageUsageFlags flags = 0;
     if (any(usage & TextureUsage::Storage))     flags |= VK_IMAGE_USAGE_STORAGE_BIT;
     if (any(usage & TextureUsage::Sampled))     flags |= VK_IMAGE_USAGE_SAMPLED_BIT;
-    if (any(usage & TextureUsage::TransferSrc)) flags |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-    if (any(usage & TextureUsage::TransferDst)) flags |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (any(usage & TextureUsage::CopySrc))     flags |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    if (any(usage & TextureUsage::CopyDst))     flags |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     return flags;
 }
 
