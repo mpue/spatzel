@@ -1,12 +1,19 @@
 # fitzel — Architecture
 
-A portable engine base with swappable graphics backends. The point of this
-repository is not features; it is the **RHI seam**: a single header that
-describes everything the engine is allowed to know about the GPU.
+A portable engine base with swappable graphics backends, currently rendering a
+signed-distance-field scene with a brute-force raymarcher.
 
-Two backends exist — Vulkan and OpenGL 4.6 core — and they are selected at
-runtime with `--backend=vulkan|opengl`, without a rebuild. The second backend
-exists to prove the seam, not because the engine needs OpenGL.
+Two things in here are load-bearing:
+
+- the **RHI seam** — a single header describing everything the engine is
+  allowed to know about the GPU. Two backends exist, Vulkan and OpenGL 4.6
+  core, selected at runtime with `--backend=vulkan|opengl` without a rebuild.
+  The second backend exists to prove the seam, not because the engine needs
+  OpenGL.
+- the **reference renderer** — a deliberately unaccelerated raymarcher that
+  defines what correct output looks like for a given scene description.
+
+Both exist to make a later change safe rather than to be fast.
 
 ## The rule
 
@@ -283,12 +290,120 @@ Vulkan backend selects the discrete NVIDIA device while GL gets the Intel
 integrated one. That made the pixel comparison a cross-vendor test by accident,
 and it still agrees to one half-float ULP.
 
+---
+
+# The renderer
+
+## Scene representation: the edit list is the truth
+
+The scene is a small `std::vector<GpuPrimitive>` built on the CPU
+(`src/engine/scene.cpp`), uploaded once into a storage buffer, and evaluated by
+the compute kernel. **Nothing about the scene is baked into the shader body** —
+the kernel iterates a list it knows nothing about.
+
+```cpp
+struct alignas(16) GpuPrimitive {
+    float   position[4];  // xyz = translation, w = smooth-union blend radius
+    float   rotation[4];  // unit quaternion
+    float   params[4];    // per type
+    float   albedo[4];    // rgb
+    int32_t control[4];   // x = PrimitiveType, y = Operator
+};
+```
+
+Every member is a 16-byte slot. That makes std430 (the Vulkan variant's storage
+buffer) and std140 agree, and leaves the C++ struct byte-identical to its GLSL
+counterpart without a single padding calculation. The same trick is used for
+the camera uniforms: four `vec4`s with the scalars tucked into their `.w`
+components, because std140 aligns a `vec3` to 16 bytes anyway.
+
+Parameter conventions are shared between `scene.hpp` and `raymarch.comp`:
+
+| Type | `params` |
+|---|---|
+| Sphere | `x` = radius |
+| Box | `xyz` = half extents, `w` = corner rounding |
+| Torus | `x` = major radius, `y` = minor radius |
+| Plane | `xyz` = unit normal, `w` = offset |
+
+**There is no scale, deliberately.** A non-uniform scale destroys the distance
+metric that sphere tracing depends on: the field stops being a true distance
+function, and the marcher either overshoots through surfaces or crawls.
+Translation and rotation are what an SDF primitive can carry exactly, so those
+are what the transform holds.
+
+Operators are `Union` and `SmoothUnion` (polynomial `smin`). `smin` returns its
+mix factor alongside the blended distance so the albedo can follow the same
+blend — which is what makes the transition zone legible instead of only
+visible in silhouette.
+
+This is also the first real consumer of the RHI buffer API
+(`createBuffer` / `updateBuffer` / `bindStorageBuffer`), which had been carried
+unproven since milestone 1.
+
+## The reference renderer
+
+The raymarcher is **brute force on purpose**. Every distance query evaluates
+every primitive in the list; there is no acceleration structure, no spatial
+subdivision, no caching. Normals cost six more full evaluations per shaded
+pixel.
+
+That is not a shortcut to be optimised away later — it is the point. This
+renderer is the definition of correct for this scene representation. The
+brick-accelerated path that comes next consumes the same edit list and is
+correct exactly insofar as it reproduces this one, pixel for pixel. Any
+divergence is a bug in the accelerated path, never a disagreement between two
+equally valid renderers.
+
+Which is why the verification harness from the previous milestone matters here:
+`--dump` / `--compare` already reads a render target back and diffs it against
+a reference within a tolerance. The accelerated renderer inherits that harness
+unchanged.
+
+The marching loop itself: 192 steps maximum, a hit threshold that widens with
+distance (a texel covers more world space further out, so demanding a fixed
+epsilon there only wastes steps), and a fade into the background near the march
+limit so the unbounded ground plane does not end in a hard line.
+
+Shading is one directional light plus a hemispherical ambient term. No shadows,
+no ambient occlusion — both were offered and both were declined, because
+neither is needed to validate the path.
+
+## Camera and input
+
+`platform::InputState` is a neutral snapshot refreshed by `pollEvents`: key and
+button state plus a cursor delta, with GLFW key codes staying inside the
+platform layer. Consumers read state rather than subscribing to events, because
+everything driven by input so far is continuous rather than discrete.
+
+Look is hold-to-engage on the right mouse button — the cursor is captured only
+while it is held, so the window stays resizable and alt-tab needs no special
+handling. Raw motion is enabled during capture, and the reference position is
+re-seeded on every transition so the first frame after one reports no movement.
+
+`engine::FlyCamera` consumes that snapshot and knows nothing about GLFW. It
+stores yaw and pitch rather than a basis, which makes roll structurally
+impossible. Horizontal motion follows the view, vertical follows the world, so
+looking down does not drag the camera into the floor. WASD, Q/E for vertical,
+left shift to boost.
+
+Delta time is clamped to 100 ms, so a stall — a breakpoint, a swapchain rebuild
+— cannot teleport the camera on the frame after it. In a pinned run
+(`--dump` / `--compare`) the camera is frozen along with the clock, for the same
+reason: a free-flying camera would make two runs incomparable.
+
+`src/engine/math.hpp` is deliberately not a maths library. When something needs
+matrices, quaternion slerp or SIMD, that is the moment to pull in a real one
+rather than to grow that file.
+
+---
+
 ## Engine
 
 ```
 beginFrame()                 -> rebuilds the swapchain if it was invalidated
 swapchainExtent()            -> authoritative only now; render target resized
-bindComputePipeline / bindStorageTexture / pushConstants / dispatch
+bindComputePipeline / bindStorageTexture / bindStorageBuffer / pushConstants / dispatch
 blitToSwapchain(target)
 endFrame()                   -> submit + present, or just swap buffers
 ```
@@ -366,20 +481,25 @@ orientation or colour space unstated.
 
 ## Status
 
-Both backends render the compute probe pass and present it. Switching is
-`--backend=vulkan|opengl` with no rebuild. Output is pixel-identical on screen
-and agrees to one half-float ULP under `--compare`. Debug builds produce zero
-Vulkan validation messages and zero GL debug messages; the build itself is
+Both backends build and run. The brute-force SDF raymarcher renders the fixed
+scene — a plane, a torus, two spheres joined by a smooth union, and a rotated
+rounded box — with live free-fly navigation. Switching is
+`--backend=vulkan|opengl` with no rebuild. Debug builds produce zero Vulkan
+validation messages and zero GL debug messages; the build itself is
 warning-free.
+
+Cross-backend pixel parity was a milestone-2 criterion and is no longer one.
+Both backends currently agree, but that is not a maintained guarantee.
 
 ## Proposals, not built
 
-- **The buffer API is still unexercised.** `createBuffer`, `updateBuffer` and
-  `bindStorageBuffer` now exist twice over and are used by nothing. Either give
-  the probe pass a reason to use one, or remove them until a feature needs them.
 - **`--compare` should read the presented image, not just the storage image.**
   Leak #7 slipped past it. A swapchain readback would close that gap and make
-  the harness a real golden-image test.
-- **CI.** Windows and Linux configure/build, `check_seam`, and a
-  `--backend vulkan --dump` / `--backend opengl --compare` pair as a smoke
-  test. The comparison is already exit-code driven, so this is mostly YAML.
+  the harness a real golden-image test — which matters more now that the
+  harness is the acceptance test for the accelerated renderer.
+- **A golden reference committed to the repository.** `--dump` output for a
+  fixed camera pose, so the reference renderer is pinned against regression and
+  not only against itself.
+- **CI.** Windows and Linux configure/build, `check_seam`, and a `--dump` /
+  `--compare` pair as a smoke test. The comparison is already exit-code driven,
+  so this is mostly YAML.
