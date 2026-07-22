@@ -31,12 +31,24 @@ void GlCommandList::bindStorageBuffer(uint32_t slot, BufferHandle handle) {
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, slot, buffer.buffer);
 }
 
+void GlCommandList::clearBuffer(BufferHandle handle) {
+    const GlBuffer&    buffer = m_device.m_buffers.get(handle);
+    const unsigned int zero   = 0;
+    // A GPU-side clear, so the buffer never needs host-writable storage and can
+    // stay readback-optimised. The dispatch that follows sees the zeroes: its
+    // pre-dispatch GL_BUFFER_UPDATE / GL_SHADER_STORAGE barrier covers this.
+    glClearNamedBufferData(buffer.buffer, GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
+}
+
 void GlCommandList::dispatch(uint32_t gx, uint32_t gy, uint32_t gz) {
     // GL's equivalent of the Vulkan backend's pre-dispatch barrier: make any
     // earlier access to these images and buffers complete before the shader
-    // touches them. The storage-buffer bit is what makes the dispatch-ordering
-    // guarantee in rhi.hpp true for a multi-pass algorithm.
-    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
+    // touches them. The storage-buffer bit orders a previous dispatch's writes;
+    // the buffer-update bit orders a previous clearBuffer. Together they make
+    // the dispatch-ordering guarantee in rhi.hpp true for a multi-pass
+    // algorithm.
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT |
+                    GL_BUFFER_UPDATE_BARRIER_BIT);
     glDispatchCompute(gx, gy, gz);
     // And the post-dispatch half, so the blit and any readback see the writes.
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT |

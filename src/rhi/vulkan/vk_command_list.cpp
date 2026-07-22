@@ -16,7 +16,14 @@ void VulkanCommandList::reset(VkCommandBuffer cmd, VkDescriptorPool descriptorPo
 void VulkanCommandList::bindComputePipeline(PipelineHandle handle) {
     const Pipeline& pipeline = m_device.m_pipelines.get(handle);
     vkCmdBindPipeline(m_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline);
-    m_pipeline      = handle;
+    m_pipeline = handle;
+    // A new pipeline may have a different set layout, so the descriptors bound
+    // for the previous one no longer apply: writing a stale slot into a layout
+    // that lacks it is a validation error. The caller re-binds its resources
+    // after every bindComputePipeline, so clearing here is free — and it is
+    // what lets one frame run several pipelines (the bake's classify and fill
+    // passes, then the marcher) through a single command list.
+    m_bindings.clear();
     m_bindingsDirty = true;
 }
 
@@ -48,6 +55,14 @@ void VulkanCommandList::bindStorageBuffer(uint32_t slot, BufferHandle buffer) {
     setBinding({.slot = slot, .type = BindingType::StorageBuffer, .buffer = buffer});
 }
 
+void VulkanCommandList::clearBuffer(BufferHandle handle) {
+    const Buffer& buffer = m_device.m_buffers.get(handle);
+    // The transfer-write half of the ordering guarantee is picked up by the
+    // pre-dispatch memory barrier in flushBindings, which lists the transfer
+    // stage as a source.
+    vkCmdFillBuffer(m_cmd, buffer.buffer, 0, buffer.size, 0);
+}
+
 void VulkanCommandList::flushBindings() {
     const Pipeline& pipeline = m_device.m_pipelines.get(m_pipeline);
 
@@ -75,8 +90,8 @@ void VulkanCommandList::flushBindings() {
     const VkMemoryBarrier2 memoryBarrier{
         .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
         .pNext         = nullptr,
-        .srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-        .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        .srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+        .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
         .dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
         .dstAccessMask =
             VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,

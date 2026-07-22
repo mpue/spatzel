@@ -193,9 +193,17 @@ public:
     virtual void bindStorageTexture(uint32_t slot, TextureHandle tex)  = 0;
     virtual void bindStorageBuffer(uint32_t slot, BufferHandle buffer) = 0;
 
+    // Zero a buffer's bytes. The one write a bump-allocated pass needs before
+    // its atomics run, and one the interface could not otherwise express
+    // without a host round-trip that would pin the buffer in host-visible
+    // memory. Ordered like a dispatch: a dispatch recorded after it sees the
+    // cleared bytes (see dispatch()).
+    virtual void clearBuffer(BufferHandle buffer)                      = 0;
+
     // Dispatches are ordered against each other: everything a dispatch writes
-    // to a storage texture or a storage buffer is visible to every dispatch
-    // recorded after it, and to a subsequent blitToSwapchain or readback.
+    // to a storage texture or a storage buffer — and every preceding
+    // clearBuffer — is visible to every dispatch recorded after it, and to a
+    // subsequent blitToSwapchain or readback.
     //
     // Stated because a multi-pass algorithm depends on it and cannot express it
     // — barriers are deliberately absent from this interface, so the guarantee

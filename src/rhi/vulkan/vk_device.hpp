@@ -40,6 +40,7 @@ public:
     void pushConstants(std::span<const std::byte> data) override;
     void bindStorageTexture(uint32_t slot, TextureHandle texture) override;
     void bindStorageBuffer(uint32_t slot, BufferHandle buffer) override;
+    void clearBuffer(BufferHandle buffer) override;
     void dispatch(uint32_t gx, uint32_t gy, uint32_t gz) override;
     void blitToSwapchain(TextureHandle src) override;
 

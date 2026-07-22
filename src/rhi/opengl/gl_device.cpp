@@ -294,8 +294,43 @@ void GlDevice::readBuffer(BufferHandle handle, std::span<std::byte> out, uint64_
 
     // Anything a compute pass wrote has to be visible to the client read.
     glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
-    glGetNamedBufferSubData(buffer.buffer, static_cast<GLintptr>(offset),
-                            static_cast<GLsizeiptr>(out.size()), out.data());
+
+    // Reading a device-local buffer straight to the host — glGetNamedBufferSubData
+    // or a direct map — migrates it out of video memory, which the driver flags
+    // as a performance warning and which would also thrash a buffer the render
+    // path still uses. So stage it exactly as the Vulkan backend does: a
+    // GPU-side copy into a transient host-readable buffer (the source stays in
+    // video), then map that. Genuinely host-visible sources are mapped directly.
+    if (buffer.hostVisible) {
+        const void* mapped = glMapNamedBufferRange(buffer.buffer, static_cast<GLintptr>(offset),
+                                                   static_cast<GLsizeiptr>(out.size()),
+                                                   GL_MAP_READ_BIT);
+        if (mapped == nullptr) {
+            throw std::runtime_error("rhi: readBuffer failed to map a host-visible buffer");
+        }
+        std::memcpy(out.data(), mapped, out.size());
+        glUnmapNamedBuffer(buffer.buffer);
+        return;
+    }
+
+    GLuint staging = 0;
+    glCreateBuffers(1, &staging);
+    // GL_CLIENT_STORAGE_BIT asks the driver to keep the staging buffer in host
+    // memory from the start, so the GPU copy lands there directly and the map
+    // reads host memory — no video->host migration, and no performance warning.
+    glNamedBufferStorage(staging, static_cast<GLsizeiptr>(out.size()), nullptr,
+                         GL_MAP_READ_BIT | GL_CLIENT_STORAGE_BIT);
+    glCopyNamedBufferSubData(buffer.buffer, staging, static_cast<GLintptr>(offset), 0,
+                             static_cast<GLsizeiptr>(out.size()));
+    const void* mapped =
+        glMapNamedBufferRange(staging, 0, static_cast<GLsizeiptr>(out.size()), GL_MAP_READ_BIT);
+    if (mapped == nullptr) {
+        glDeleteBuffers(1, &staging);
+        throw std::runtime_error("rhi: readBuffer failed to map its staging buffer");
+    }
+    std::memcpy(out.data(), mapped, out.size());
+    glUnmapNamedBuffer(staging);
+    glDeleteBuffers(1, &staging);
 }
 
 void GlDevice::destroy(TextureHandle handle) {
