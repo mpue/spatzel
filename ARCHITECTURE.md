@@ -1,9 +1,10 @@
 # fitzel — Architecture
 
-A portable engine base with swappable graphics backends, currently rendering a
-signed-distance-field scene with a brute-force raymarcher.
+A portable engine base with swappable graphics backends, rendering a
+signed-distance-field scene two ways: a brute-force reference raymarcher and a
+sparse-brick-accelerated renderer validated against it.
 
-Two things in here are load-bearing:
+Three things in here are load-bearing:
 
 - the **RHI seam** — a single header describing everything the engine is
   allowed to know about the GPU. Two backends exist, Vulkan and OpenGL 4.6
@@ -12,8 +13,12 @@ Two things in here are load-bearing:
   OpenGL.
 - the **reference renderer** — a deliberately unaccelerated raymarcher that
   defines what correct output looks like for a given scene description.
+- the **brick renderer** — an accelerated path that marches a baked, cached
+  copy of the field. It is correct exactly insofar as it reproduces the
+  reference, within a documented tolerance; the reference is what makes that a
+  checkable claim rather than an assertion.
 
-Both exist to make a later change safe rather than to be fast.
+The first two exist to make the third safe rather than to be fast.
 
 ## The rule
 
@@ -230,9 +235,11 @@ covers the part of the path it actually reads. Both checks were needed.
   uniform block). Explicit bindings remain preferable to SPIR-V reflection,
   which would drag a reflection dependency to a layer that must not know what
   SPIR-V is.
-- **The buffer API.** `createBuffer` / `updateBuffer` / `bindStorageBuffer` are
-  implemented by both backends and used by nothing. They are unproven surface;
-  see the proposals at the end of this document.
+- **The buffer API.** `createBuffer` / `updateBuffer` / `bindStorageBuffer` were
+  unproven surface at the time of the second backend. They are no longer: the
+  edit list exercised them, and the brick renderer leans on them hard —
+  alongside the `clearBuffer` / `readBuffer` and dispatch-ordering additions the
+  brick milestone made (see the RHI section).
 
 ---
 
@@ -245,6 +252,32 @@ What is deliberately **not** in the interface: barriers, image layouts,
 descriptor pools, semaphores, fences, frames in flight, swapchain acquisition,
 device-idle waits, and shader binaries. Every one of those is a place where the
 two existing backends already disagree.
+
+### What the brick milestone added to the contract
+
+Building the brick renderer needed three things the seam could not express. Each
+is a contract change stated in `rhi.hpp`, not a reach into a backend — the same
+discipline the second backend established.
+
+- **Dispatch ordering.** A multi-pass compute algorithm needs pass *N+1* to see
+  what pass *N* wrote. Both backends already covered the image hazard between
+  two dispatches; neither covered storage buffers. Since barriers are absent
+  from the interface, the caller cannot fix that itself, so the guarantee is now
+  contractual: *everything a dispatch (or a `clearBuffer`) writes is visible to
+  every dispatch recorded after it.* Vulkan emits a global `VkMemoryBarrier2`
+  before each dispatch; GL adds the storage-buffer and buffer-update bits to the
+  barrier it already issued. Ordering only — never a synchronisation primitive
+  the caller can name.
+- **`clearBuffer`.** The bake's bump allocator needs its counter zeroed before
+  the atomics run. Doing that with a host write would pin the counter in
+  host-visible memory, the worst place for an atomically-updated buffer. So the
+  seam gained a GPU-side zero (`vkCmdFillBuffer` / `glClearNamedBufferData`),
+  ordered like a dispatch.
+- **`readBuffer`.** The mirror of `readTexture`: a blocking, verification-only
+  readback so what the bake wrote can be inspected, not merely believed. The
+  source must carry `BufferUsage::CopySrc`. Both backends stage a device-local
+  buffer through a host copy — on GL that also sidesteps the driver's
+  video→host migration warning, keeping the bake free of debug messages.
 
 ## Vulkan backend
 
@@ -369,6 +402,146 @@ Shading is one directional light plus a hemispherical ambient term. No shadows,
 no ambient occlusion — both were offered and both were declined, because
 neither is needed to validate the path.
 
+---
+
+# The brick renderer
+
+The accelerated path. The reference marches the edit list at every distance
+query; the brick renderer marches a **baked, cached copy** of the field and
+consults the edit list only once per shaded pixel, for the hit albedo. The
+reference stays as ground truth and both are switchable at runtime (keys `1`
+and `2`, or `--renderer`).
+
+## What is shared, and why it must be
+
+The scene SDF — the primitive distance functions, the operators, the fold over
+the edit list — lives in `shaders/sdf_scene.glsl`, and the shading model in
+`shaders/shading.glsl`. The reference marcher, both bake passes and the brick
+marcher all `#include` them. This is load-bearing: "the brick path reproduces
+the reference" is only meaningful if the two evaluate *the same* field. A second
+copy of the evaluation would let the claim decay into "two implementations that
+happen to agree today". The build compiles each `.comp` twice as before; a
+changed include rebuilds every dependent module (glslc's `-MD` depfile, plus an
+explicit `INCLUDES` list for glslangValidator, which emits none).
+
+## The structure
+
+Constants live once in `shaders/brick_common.glsl` and are mirrored in
+`src/engine/brick.hpp`; the two must agree byte for byte.
+
+- **Bounded AABB, dense top-level index.** A fixed `64³` grid covers a bounded
+  world AABB (`brick::kAabbMin`/`kAabbMax`). One `Cell { int brickSlot; float
+  emptyDistance; }` per grid cell, in a single storage buffer indexed
+  `z·64² + y·64 + x`. `brickSlot < 0` marks an **empty** cell — one the bake
+  proved holds no surface — and `emptyDistance` is then the signed scene
+  distance at the cell centre, the basis for empty-space skipping. Otherwise
+  `brickSlot` indexes the pool.
+- **Sparse brick pool.** Only surface-adjacent cells take a slot. A brick is an
+  `8³` block of interior voxels plus a **one-voxel apron** on every side —
+  `10³ = 1000` floats — in a flat pool buffer, slot `s` at `[s·1000, s·1000 +
+  1000)`. Voxels are **cell-centred**: interior voxel 0 sits half a voxel inside
+  the cell's minimum corner, so the apron voxels straddle the cell boundary.
+  That is exactly what lets a trilinear read *anywhere inside the cell* reach
+  only the eight samples this brick owns, with no cross-brick fetch and no seam
+  where two bricks meet.
+- **Fixed pool.** `kPoolCapacity` slots (`24576`, ~94 MiB). The fixed scene
+  bakes to ~16.6k occupied cells; the ground plane dominates, because the
+  conservative occupancy test uses a cell's 3D diagonal and a flat plane still
+  claims several vertical layers. Overflow is counted and reported as a hard
+  failure — never silently truncated.
+
+Everything is a `std430` storage buffer, not a 3D texture: the trilinear filter
+is done by hand, so the RHI needs no sampler or 3D-image vocabulary.
+
+## The bake — two compute passes
+
+Recorded once, ahead of the first frame's marcher, into the same command list.
+The pass ordering is the seam's guarantee (see the RHI section), so the marcher
+in that frame already sees a finished bake.
+
+1. **`bake_classify.comp`** — one thread per cell. It evaluates the shared scene
+   SDF at the cell centre. A surface farther from the centre than the distance
+   to the farthest sampled corner (`length(½·cell + ½·voxel)`) cannot reach any
+   voxel, because the field is **Lipschitz-1** (both `min` and the polynomial
+   `smin` are). So `abs(d) ≤ that radius` is a *conservative* occupancy test: it
+   never drops a cell that holds a surface, with no tuned fudge factor. Occupied
+   cells claim a slot from a bump allocator (`atomicAdd` on a stats buffer that
+   `clearBuffer` zeroed first); empty cells store the centre distance.
+2. **`bake_fill.comp`** — one workgroup per cell, one thread per voxel (`10³`).
+   Empty cells early-out; occupied cells sample the shared scene SDF at each
+   voxel's cell-centred world position and write it into the brick.
+
+After the frame is submitted, the host reads the stats buffer back
+(`Device::readBuffer`) and logs occupancy and overflow. `--debug-view 2` (or key
+`3`) tints brick-hit pixels, a direct visual check that occupancy matches the
+silhouettes.
+
+## The march
+
+`raymarch_brick.comp` DDAs the top-level grid. In an **empty** cell — provably
+surface-free — it advances at least to the cell's far face, and further when the
+Lipschitz bound `abs(emptyDistance) − dist(p, centre)` allows a bigger leap. In
+an **occupied** cell it sphere-traces the trilinearly-sampled brick, but never
+steps past the cell's far face: a brick only describes surfaces within its own
+cell and apron, so a larger reported distance must not be trusted to leap over a
+neighbour's surface. A ray exactly parallel to an axis makes the slab arithmetic
+`0·∞ = NaN` on a cell boundary; the components of the direction are nudged off
+zero to keep that from seaming the image down the middle.
+
+Normals come from the **gradient of the brick field** (central differences at
+half a voxel, which keeps every sample inside the brick's valid domain). Albedo
+is a single edit-list evaluation at the hit, because bricks store distance only
+— material is a non-goal here.
+
+`--debug-view 1` (or cycling with key `3`) renders a **step-count heat map**:
+sky and near ground come back cheap (few steps, the empty-space skipping
+working), the horizon grazing band and the object silhouettes cost more.
+
+## Reference vs brick: the tolerance
+
+The reference is correct by definition, so every difference is the brick path's
+to account for. Measured on the pinned comparison camera, `1280×720`:
+
+```
+fitzel --backend vulkan --renderer reference --frames 5 --dump ref.fzld
+fitzel --backend vulkan --renderer brick     --frames 5 --compare ref.fzld --max-outlier-fraction 0.15
+[compare] PASS — max 0.814453, mean 0.006022, 340818/3686400 (9.25%) components over tolerance 0.003922, outlier budget 15.0000%
+```
+
+This is deliberately **not** a max-error test, and the reason is structural. Two
+distinct differences exist, neither a bug:
+
+- **Trilinear normal shading.** The brick field's gradient approximates the
+  analytic normal by a few degrees on curved surfaces, which shifts the diffuse
+  term by a few `1/255` across the whole lit surface — not just at silhouettes.
+  This is the "trilinear filter error" the milestone anticipated. The *mean*
+  deviation is ~1.5/255; the surfaces are visually indistinguishable.
+- **The finite AABB and the infinite plane.** The ground plane is unbounded, but
+  the brick grid is not. Beyond the AABB the brick marcher shows background
+  where the reference shows ground fading toward the horizon — a band near the
+  horizon line. The AABB is sized wide enough (`±20` horizontally) that the band
+  falls where the reference has already begun fading the ground out, keeping its
+  amplitude down, but it cannot be eliminated without a hierarchy the non-goals
+  exclude. Note that the plane's SDF is *linear*, so trilinear reproduces it
+  **exactly** inside the AABB — the near ground matches to a fraction of a level.
+
+So the acceptance test is an **outlier budget**: `--max-outlier-fraction` passes
+the comparison when at most that fraction of components exceed `--tolerance`.
+The two effects above put ~9% of components over `1/255`; the budget is set to
+`0.15` with headroom. At its default of `0` the flag is inert and `--compare`
+keeps its strict cross-backend max-error behaviour unchanged. Because the bake
+and march are deterministic, the brick image is **bit-identical across
+backends** — GL brick vs Vulkan brick is `max 0.000000`.
+
+## What this deliberately is not
+
+No GPU-driven or dynamic brick allocation (the bump allocator runs once, within
+one static bake), no hashed or hierarchical index, no streaming or paging, no
+incremental re-bake, no runtime sculpting, no LOD or mip-bricks, no material in
+the bricks, and no performance-tuning pass. A dense top-level index over a
+bounded AABB is the whole of v1; the structural win is the point, not the
+numbers.
+
 ## Camera and input
 
 `platform::InputState` is a neutral snapshot refreshed by `pollEvents`: key and
@@ -403,24 +576,40 @@ rather than to grow that file.
 ```
 beginFrame()                 -> rebuilds the swapchain if it was invalidated
 swapchainExtent()            -> authoritative only now; render target resized
-bindComputePipeline / bindStorageTexture / bindStorageBuffer / pushConstants / dispatch
+[first frame only] recordBake -> clearBuffer + classify + fill dispatches
+bindComputePipeline / bindStorageTexture / bindStorageBuffer / clearBuffer / pushConstants / dispatch
 blitToSwapchain(target)
 endFrame()                   -> submit + present, or just swap buffers
+[after first frame] readBuffer(stats) -> log occupancy / overflow
 ```
 
 The render target is resized *after* `beginFrame`, because that is the first
 moment the new surface size is known. Creating and destroying resources during
 recording is safe by contract.
 
+The bake is recorded into the first frame's command list, before that frame's
+marcher; the dispatch-ordering guarantee is what lets the marcher read a bake
+that was written moments earlier in the same list. The stats readback happens
+*after* `endFrame` submits, since `readBuffer` stalls the device until the work
+it is reading has completed. One subtlety the multi-pipeline bake surfaced: the
+Vulkan command list now clears its pending bindings when a new pipeline is
+bound, because a frame that runs classify, fill and the marcher in turn would
+otherwise carry a slot from one pipeline's set layout into the next and trip
+validation. The caller re-binds after every `bindComputePipeline` regardless, so
+this costs nothing.
+
 ## Verification
 
 `--frames N` runs a fixed number of frames and shuts down normally.
 
 `--dump <file>` writes the final frame — magic, extent, linear RGBA floats —
-via `Device::readTexture`. `--compare <file>` reads one back and reports max
-and mean per-component deviation, failing the process if the maximum exceeds
-`--tolerance` (default 1/255). Both flags pin the animation clock, since two
-runs of a time-varying shader could otherwise never agree.
+via `Device::readTexture`. `--compare <file>` reads one back and reports max and
+mean per-component deviation. It fails the process when the maximum exceeds
+`--tolerance` (default 1/255) — unless `--max-outlier-fraction f` is given, in
+which case it passes as long as at most fraction `f` of components exceed the
+tolerance. Both flags pin the animation clock, and the pinned run also freezes
+the renderer selection, since two runs of a time-varying shader could otherwise
+never agree.
 
 ```
 fitzel --backend vulkan --frames 30 --dump probe.fzld
@@ -428,9 +617,13 @@ fitzel --backend opengl --frames 30 --compare probe.fzld
 [compare] PASS — max 0.000488, mean 0.000000, 0/3686400 components over tolerance 0.003922
 ```
 
-0.000488 is one ULP of `RGBA16F` in that range. This is the intended
-foundation for golden-image tests — with the caveat recorded under leak #7:
-it reads the storage image, not the presented image.
+0.000488 is one ULP of `RGBA16F` in that range. The strict max test is right for
+the cross-backend comparison, where the same shader must agree to a ULP; the
+outlier-fraction form is what the reference-vs-brick A/B needs, where a small,
+structural set of components legitimately differs (see the brick renderer's
+tolerance section). This is the intended foundation for golden-image tests —
+with the caveat recorded under leak #7: it reads the storage image, not the
+presented image.
 
 ## Platforms
 
@@ -481,15 +674,30 @@ orientation or colour space unstated.
 
 ## Status
 
-Both backends build and run. The brute-force SDF raymarcher renders the fixed
-scene — a plane, a torus, two spheres joined by a smooth union, and a rotated
-rounded box — with live free-fly navigation. Switching is
-`--backend=vulkan|opengl` with no rebuild. Debug builds produce zero Vulkan
-validation messages and zero GL debug messages; the build itself is
-warning-free.
+Both backends build and run, on Vulkan and OpenGL, switchable with
+`--backend=vulkan|opengl` and no rebuild. Both renderers render the fixed scene
+— a plane, a torus, two spheres joined by a smooth union, and a rotated rounded
+box — with live free-fly navigation:
 
-Cross-backend pixel parity was a milestone-2 criterion and is no longer one.
-Both backends currently agree, but that is not a maintained guarantee.
+- The **reference** brute-force raymarcher, unchanged in behaviour (its scene
+  and shading moved into shared includes, verified bit-identical).
+- The **brick** renderer, baking the field once at startup and marching the
+  sparse structure. Runtime `1`/`2` switch renderers, `3` cycles the brick debug
+  views; `--renderer` and `--debug-view` set them from the CLI.
+
+Reference-vs-brick agrees within the documented outlier tolerance
+(`--max-outlier-fraction`); the brick image is bit-identical across the two
+backends. Debug builds produce **zero Vulkan validation messages and zero GL
+debug messages** across the bake and both render paths.
+
+One build warning remains and is **not** from this work: MSVC emits `LNK4098`
+(a `LIBCMT` CRT-mix from a `FetchContent` dependency) on the Visual Studio
+toolchain used here. It is present on the milestone-2 tip too — verified by
+building that commit — and is a toolchain/dependency artifact, not a code issue.
+
+Cross-backend pixel parity of the *reference* was a milestone-2 criterion and is
+no longer one; both backends currently agree to a ULP, but that is not a
+maintained guarantee.
 
 ## Proposals, not built
 
