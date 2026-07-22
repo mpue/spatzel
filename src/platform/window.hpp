@@ -116,6 +116,17 @@ public:
     // dereference it.
     [[nodiscard]] void* nativeHandle() const { return m_handle; }
 
+    // --- ImGui GLFW backend ------------------------------------------------
+    //
+    // The input half of the debug UI. Pure windowing glue — no graphics API —
+    // so it lives here rather than behind the RHI seam. Requires an ImGui
+    // context to already exist (the engine owns it). initUi installs the GLFW
+    // input callbacks (chaining this window's own), beginUiFrame refreshes the
+    // per-frame input snapshot ImGui reads.
+    void initUi();
+    void beginUiFrame();
+    void shutdownUi();
+
 private:
     void updateInput();
     void setCursorCaptured(bool captured);

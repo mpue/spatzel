@@ -32,6 +32,10 @@ public:
     }
 
     [[nodiscard]] VkImage     image(uint32_t index) const { return m_images[index]; }
+    // Colour-attachment view of image `index`, for the ImGui overlay's dynamic
+    // rendering pass. The blit path addresses the image directly and does not
+    // use these.
+    [[nodiscard]] VkImageView imageView(uint32_t index) const { return m_views[index]; }
     [[nodiscard]] VkSemaphore renderFinished(uint32_t index) const {
         return m_renderFinished[index];
     }
@@ -48,6 +52,7 @@ private:
     vkb::Device&             m_device;
     vkb::Swapchain           m_swapchain{};
     std::vector<VkImage>     m_images;
+    std::vector<VkImageView> m_views;
     std::vector<VkSemaphore> m_renderFinished;
     std::vector<VkImageLayout> m_layouts;
 };

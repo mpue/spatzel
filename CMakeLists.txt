@@ -88,6 +88,20 @@ FetchContent_Declare(glad
     GIT_SHALLOW    ON
     SOURCE_SUBDIR  cmake)
 
+# Dear ImGui ships no CMake of its own; we compile the core and the platform
+# backend into libraries of our own below. The graphics-API render backends are
+# compiled per RHI backend, in src/, so no imgui_impl_<api> ever crosses the
+# seam.
+FetchContent_Declare(imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG        v1.91.8
+    GIT_SHALLOW    ON)
+
+FetchContent_Declare(nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG        v3.11.3
+    GIT_SHALLOW    ON)
+
 FetchContent_MakeAvailable(glfw)
 
 if(FITZEL_WITH_VULKAN)
@@ -109,6 +123,36 @@ if(FITZEL_WITH_OPENGL)
     FetchContent_MakeAvailable(glad)
     glad_add_library(fitzel_glad REPRODUCIBLE API gl:core=4.6)
 endif()
+
+# ---------------------------------------------------------------------------
+# Editor UI dependencies
+#
+# Dear ImGui for the panel, nlohmann/json for human-readable scene files. The
+# ImGui core is backend-neutral (its symbols are plain `ImGui::`); only the
+# render backends are API-specific, and those are compiled inside
+# src/rhi/<backend>/, never above the seam. The GLFW platform backend touches
+# only windowing, so it lives with the platform layer.
+# ---------------------------------------------------------------------------
+set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(imgui nlohmann_json)
+
+# ImGui core. Third-party, so it is kept off fitzel_warnings.
+add_library(imgui STATIC
+    "${imgui_SOURCE_DIR}/imgui.cpp"
+    "${imgui_SOURCE_DIR}/imgui_draw.cpp"
+    "${imgui_SOURCE_DIR}/imgui_tables.cpp"
+    "${imgui_SOURCE_DIR}/imgui_widgets.cpp")
+target_include_directories(imgui PUBLIC
+    "${imgui_SOURCE_DIR}" "${imgui_SOURCE_DIR}/backends")
+
+# The GLFW platform backend for ImGui. Pure windowing glue — no graphics API —
+# so it belongs beside the platform layer, not behind the seam.
+add_library(imgui_glfw STATIC
+    "${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp")
+target_link_libraries(imgui_glfw PUBLIC imgui glfw)
+
+# Path to the ImGui render backends, so each RHI backend can compile its own.
+set(FITZEL_IMGUI_BACKENDS_DIR "${imgui_SOURCE_DIR}/backends")
 
 # ---------------------------------------------------------------------------
 # Project targets

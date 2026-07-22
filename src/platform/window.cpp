@@ -1,5 +1,7 @@
 #include "platform/window.hpp"
 
+#include <backends/imgui_impl_glfw.h>
+
 #include <GLFW/glfw3.h>
 
 #include <chrono>
@@ -162,6 +164,18 @@ void Window::setCursorCaptured(bool captured) {
     m_input.m_cursorDeltaX = 0.0;
     m_input.m_cursorDeltaY = 0.0;
 }
+
+void Window::initUi() {
+    // install_callbacks = true: ImGui installs its own GLFW callbacks and
+    // chains this window's existing framebuffer-size callback, so both keep
+    // firing. InitForOther works for any render backend — the client-API value
+    // only matters to the multi-viewport path, which is not enabled.
+    ImGui_ImplGlfw_InitForOther(asGlfw(m_handle), true);
+}
+
+void Window::beginUiFrame() { ImGui_ImplGlfw_NewFrame(); }
+
+void Window::shutdownUi() { ImGui_ImplGlfw_Shutdown(); }
 
 void Window::waitEvents() const { glfwWaitEvents(); }
 

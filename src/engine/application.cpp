@@ -1,5 +1,9 @@
 #include "engine/application.hpp"
 
+#include "engine/scene_io.hpp"
+
+#include <imgui.h>
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -55,19 +59,21 @@ Application::Application(const AppConfig& config)
                                      .shaderRoot         = m_shaderRoot.c_str(),
                                  });
 
-    // The scene lives in a storage buffer and is uploaded once. Both the
-    // renderers and the bake read it at slot 1.
-    m_scene = buildScene();
+    // The scene lives in a storage buffer that both renderers and the bake read
+    // at slot 1. It is allocated at full capacity so the editor can add
+    // primitives without reallocating a GPU resource mid-frame; only the active
+    // prefix is uploaded and only primitiveCount of it is ever read.
+    m_scene = config.scenePath.empty() ? buildScene() : loadScene(config.scenePath);
+    if (m_scene.size() > kMaxPrimitives) {
+        m_scene.resize(kMaxPrimitives);
+    }
     m_sceneBuffer = m_device->createBuffer({
-        .size      = m_scene.size() * sizeof(GpuPrimitive),
+        .size      = static_cast<uint64_t>(kMaxPrimitives) * sizeof(GpuPrimitive),
         .usage     = rhi::BufferUsage::Storage,
         .access    = rhi::MemoryAccess::CpuToGpu,
         .debugName = "scene_primitives",
     });
-    m_device->updateBuffer(
-        m_sceneBuffer,
-        std::span<const std::byte>(reinterpret_cast<const std::byte*>(m_scene.data()),
-                                   m_scene.size() * sizeof(GpuPrimitive)));
+    uploadScene();
 
     // --- reference renderer: render target (slot 0) + edit list (slot 1) ----
     m_refShader = m_device->createShader("raymarch");
@@ -84,6 +90,25 @@ Application::Application(const AppConfig& config)
     createBrickResources();
 
     resizeRenderTarget(m_device->swapchainExtent());
+
+    // Scene files live beside the executable, next to the staged shaders.
+    m_sceneDir = std::filesystem::path(m_shaderRoot).parent_path() / "scenes";
+
+    // The editor overlay, unless this is a pinned verification run — a UI drawn
+    // into the frame would land in the compared image.
+    if (config.enableUi && !m_pinTime) {
+        initUi();
+    }
+}
+
+void Application::uploadScene() {
+    if (m_scene.size() > kMaxPrimitives) {
+        m_scene.resize(kMaxPrimitives); // capacity guard; the editor also blocks Add at the cap
+    }
+    m_device->updateBuffer(
+        m_sceneBuffer,
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(m_scene.data()),
+                                   m_scene.size() * sizeof(GpuPrimitive)));
 }
 
 void Application::createBrickResources() {
@@ -153,8 +178,12 @@ void Application::createBrickResources() {
 }
 
 Application::~Application() {
-    // No idle wait: destruction is safe to request at any time, and a backend
-    // that can still have work in flight defers the release itself.
+    // UI first, in the one order ImGui's shared context allows: the backend
+    // (which idles the GPU internally), then the platform, then the context.
+    shutdownUi();
+
+    // No idle wait for the rest: destruction is safe to request at any time, and
+    // a backend that can still have work in flight defers the release itself.
     destroyRenderTarget();
     for (rhi::BufferHandle buffer : {m_sceneBuffer, m_cellsBuffer, m_bricksBuffer, m_statsBuffer}) {
         if (rhi::isValid(buffer)) {
@@ -253,11 +282,20 @@ bool Application::run() {
         const float deltaSeconds =
             std::clamp(static_cast<float>(now - m_lastFrameTime), 0.0f, 0.1f);
         m_lastFrameTime = now;
+        // Exponential smoothing so the FPS readout does not flicker.
+        m_smoothedFrametime = m_smoothedFrametime > 0.0f
+                                  ? m_smoothedFrametime + 0.1f * (deltaSeconds - m_smoothedFrametime)
+                                  : deltaSeconds;
+
+        // When the pointer or keyboard is over the panel, the editor owns the
+        // input — do not also fly the camera or fire the renderer hotkeys.
+        const bool uiCaptures =
+            m_uiEnabled && (ImGui::GetIO().WantCaptureMouse || ImGui::GetIO().WantCaptureKeyboard);
 
         // A pinned run has to be reproducible, and a free-flying camera is
         // not. Same reasoning as the pinned clock. Renderer switching is frozen
         // too, so a comparison run renders exactly the requested path.
-        if (!m_pinTime) {
+        if (!m_pinTime && !uiCaptures) {
             m_camera.update(m_window.input(), deltaSeconds);
             handleRendererInput();
         }
@@ -282,7 +320,80 @@ bool Application::run() {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Editor UI
+//
+// The engine owns the ImGui context and issues only backend-neutral ImGui::
+// calls; the backend (behind the seam) owns the render backend, the platform
+// layer the GLFW input backend. A backend without an overlay reports so from
+// initUi and the engine simply runs without one.
+// ---------------------------------------------------------------------------
+void Application::initUi() {
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io    = ImGui::GetIO();
+    io.IniFilename = nullptr; // no imgui.ini dropped in the working directory
+    ImGui::StyleColorsDark();
+
+    if (!m_device->initUi()) {
+        // This backend has no overlay (the OpenGL backend today). Run without.
+        ImGui::DestroyContext();
+        m_uiEnabled = false;
+        return;
+    }
+    m_window.initUi();
+    m_uiEnabled = true;
+}
+
+void Application::shutdownUi() {
+    if (!m_uiEnabled) {
+        return;
+    }
+    m_device->shutdownUi(); // idles the GPU, then tears down the render backend
+    m_window.shutdownUi();
+    ImGui::DestroyContext();
+    m_uiEnabled = false;
+}
+
+void Application::buildUi() {
+    EditorStats stats;
+    stats.fps            = m_smoothedFrametime > 0.0f ? 1.0f / m_smoothedFrametime : 0.0f;
+    stats.frametimeMs    = m_smoothedFrametime * 1000.0f;
+    stats.rendererName   = m_renderer == RendererMode::Brick ? "brick" : "reference (brute force)";
+    stats.primitiveCount = static_cast<int>(m_scene.size());
+    stats.maxPrimitives  = static_cast<int>(kMaxPrimitives);
+    stats.lastBakeMs     = m_lastBakeMs;
+    stats.haveBake       = m_haveBake;
+
+    const EditorActions actions =
+        m_editor.draw(m_scene, m_renderer, /*brickAvailable=*/true, stats, m_sceneDir);
+
+    if (actions.sceneChanged || actions.bakeMeasure) {
+        // The edit list is the single source of truth; push it to the GPU and
+        // ask for a re-bake. The reference renderer needs nothing more — it
+        // re-reads the list every frame.
+        uploadScene();
+        m_needBake = true;
+    }
+    if (actions.bakeMeasure) {
+        // A committed edit (a finished drag, an add/delete, undo/redo, a load):
+        // time the resulting re-bake so the panel can report it. Live drag
+        // frames re-bake too, but unmeasured, so dragging stays smooth.
+        m_measureBake = true;
+    }
+}
+
 void Application::renderFrame() {
+    // Build the editor UI before recording: an edit this frame takes effect this
+    // frame (buffer upload and, for the brick path, a re-bake below).
+    if (m_uiEnabled) {
+        m_window.beginUiFrame();
+        m_device->beginUiFrame();
+        ImGui::NewFrame();
+        buildUi();
+        ImGui::Render();
+    }
+
     rhi::CommandList& cmd = m_device->beginFrame();
 
     // beginFrame is what actually rebuilds the swapchain, so the authoritative
@@ -290,13 +401,19 @@ void Application::renderFrame() {
     // recording is fine: destruction is deferred past the frames in flight.
     resizeRenderTarget(m_device->swapchainExtent());
 
-    // The bake is full and static, recorded once ahead of the first frame's
-    // marcher. The dispatch-ordering guarantee makes the marcher in this same
-    // command list see what the bake wrote.
+    // The bake is recorded into the frame ahead of the marcher; the
+    // dispatch-ordering guarantee makes the marcher in this same command list
+    // see what it wrote. Re-baked on every scene change (full re-bake, no
+    // incremental path). Stats are read back — which stalls the device — only
+    // when a re-bake is being timed (the first one and each committed edit), so
+    // dragging a value re-bakes every frame without a stall.
     if (m_needBake) {
         recordBake(cmd);
-        m_needBake    = false;
-        m_bakePending = true;
+        m_needBake = false;
+        if (m_measureBake) {
+            m_bakePending = true;
+            m_measureBake = false;
+        }
     }
 
     if (m_renderer == RendererMode::Reference) {
@@ -306,12 +423,21 @@ void Application::renderFrame() {
     }
     cmd.blitToSwapchain(m_renderTarget);
 
+    // The overlay draws last, on top of the presented image.
+    if (m_uiEnabled) {
+        cmd.endUiFrame();
+    }
+
+    const double submitTime = platform::timeSeconds();
     m_device->endFrame();
 
-    // Now the bake dispatches have been submitted, so their stats can be read
-    // back (readBuffer stalls the device until they complete).
     if (m_bakePending) {
+        // readBuffer waits for the submitted frame to complete, so the span from
+        // submit to here is the re-bake frame's GPU cost (bake + render + the
+        // readback stall). Reported as the re-bake time.
         reportBakeStats();
+        m_lastBakeMs  = static_cast<float>((platform::timeSeconds() - submitTime) * 1000.0);
+        m_haveBake    = true;
         m_bakePending = false;
     }
 }

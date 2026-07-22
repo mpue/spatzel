@@ -216,6 +216,14 @@ public:
     // backend's business.
     virtual void blitToSwapchain(TextureHandle src) = 0;
 
+    // Draw the current Dear ImGui frame over the image that will be presented,
+    // i.e. on top of whatever blitToSwapchain left there. Call after
+    // blitToSwapchain and only between Device::beginUiFrame and ImGui::Render.
+    // A no-op on a backend that reports no UI (see Device::initUi). The engine
+    // hands over no ImGui types — the backend fetches the draw data itself —
+    // so this stays backend-neutral.
+    virtual void endUiFrame() = 0;
+
 protected:
     CommandList() = default;
 };
@@ -291,6 +299,23 @@ public:
     virtual void destroy(BufferHandle handle)   = 0;
     virtual void destroy(ShaderHandle handle)   = 0;
     virtual void destroy(PipelineHandle handle) = 0;
+
+    // --- Debug UI overlay --------------------------------------------------
+    //
+    // Dear ImGui, split across the seam: the engine owns the ImGui context and
+    // issues only backend-neutral `ImGui::` calls; the backend owns the
+    // API-specific render backend. The GLFW input side is wired separately by
+    // the platform layer.
+    //
+    // Requires an ImGui context to already exist (the engine creates it).
+    // initUi returns false if this backend has no overlay implementation, and
+    // the engine then simply renders without one — so a backend can leave all
+    // four as no-ops and stay fully functional. Per frame, when initUi
+    // succeeded: beginUiFrame, then the engine's ImGui:: calls and
+    // ImGui::Render, then CommandList::endUiFrame after blitToSwapchain.
+    [[nodiscard]] virtual bool initUi()   = 0; // true if the overlay is available
+    virtual void               beginUiFrame() = 0; // start-of-frame backend hook
+    virtual void               shutdownUi()    = 0;
 
 protected:
     Device() = default;

@@ -1,4 +1,5 @@
 #include "engine/application.hpp"
+#include "engine/scene_io.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -21,6 +22,9 @@ void printUsage() {
                  "  --tolerance <f>            per-component tolerance for --compare\n"
                  "  --max-outlier-fraction <f> pass --compare if at most this fraction of\n"
                  "                             components exceed tolerance (default 0 = strict max)\n"
+                 "  --no-ui                    disable the editor overlay\n"
+                 "  --scene <file>             load this scene JSON at startup\n"
+                 "  --save-scene <file>        write the built-in (or --scene) list and exit\n"
                  "\n"
                  "runtime keys: 1 reference, 2 brick, 3 cycle brick debug view\n");
 }
@@ -59,6 +63,7 @@ int main(int argc, char** argv) {
 #ifndef NDEBUG
         config.enableDebug = true;
 #endif
+        std::filesystem::path saveScenePath;
 
         // SPIR-V variants are staged next to the executable by the build.
         if (argc > 0 && argv[0] != nullptr) {
@@ -93,11 +98,29 @@ int main(int argc, char** argv) {
                 config.tolerance = std::strtof(argv[++i], nullptr);
             } else if (arg == "--max-outlier-fraction" && hasValue) {
                 config.maxOutlierFraction = std::strtof(argv[++i], nullptr);
+            } else if (arg == "--no-ui") {
+                config.enableUi = false;
+            } else if (arg == "--scene" && hasValue) {
+                config.scenePath = argv[++i];
+            } else if (arg == "--save-scene" && hasValue) {
+                saveScenePath = argv[++i];
             } else {
                 std::fprintf(stderr, "unrecognised argument '%s'\n", argv[i]);
                 printUsage();
                 return 2;
             }
+        }
+
+        // Authoring helper: write the built-in (or --scene) list to a file and
+        // exit, without opening a window. Used to seed the example scenes from
+        // the canonical buildScene().
+        if (!saveScenePath.empty()) {
+            const std::vector<engine::GpuPrimitive> scene =
+                config.scenePath.empty() ? engine::buildScene()
+                                         : engine::loadScene(config.scenePath);
+            engine::saveScene(saveScenePath, scene);
+            std::fprintf(stderr, "[scene] wrote %s\n", saveScenePath.string().c_str());
+            return 0;
         }
 
         if (!rhi::isBackendAvailable(config.backend)) {

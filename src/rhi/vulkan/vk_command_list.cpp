@@ -1,5 +1,8 @@
 #include "rhi/vulkan/vk_device.hpp"
 
+#include <imgui.h>
+#include <backends/imgui_impl_vulkan.h>
+
 #include <algorithm>
 #include <stdexcept>
 
@@ -201,6 +204,46 @@ void VulkanCommandList::blitToSwapchain(TextureHandle src) {
     vkCmdBlitImage(m_cmd, texture.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                    m_device.m_swapchain->image(m_device.m_imageIndex),
                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_LINEAR);
+}
+
+void VulkanCommandList::endUiFrame() {
+    // The blit left the swapchain image in TRANSFER_DST. Move it to a colour
+    // attachment and draw ImGui over the top with dynamic rendering, loading
+    // (not clearing) so the blitted frame shows through. The transition updates
+    // the device's swapchain producer state, so endFrame's pre-present barrier
+    // waits on the colour write.
+    m_device.transitionSwapchainImage(m_cmd, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                      VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+
+    const VkExtent2D extent = m_device.m_swapchain->extent();
+    const VkRenderingAttachmentInfo colorAttachment{
+        .sType              = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .pNext              = nullptr,
+        .imageView          = m_device.m_swapchain->imageView(m_device.m_imageIndex),
+        .imageLayout        = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .resolveMode        = VK_RESOLVE_MODE_NONE,
+        .resolveImageView   = VK_NULL_HANDLE,
+        .resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .loadOp             = VK_ATTACHMENT_LOAD_OP_LOAD,
+        .storeOp            = VK_ATTACHMENT_STORE_OP_STORE,
+        .clearValue         = {},
+    };
+    const VkRenderingInfo renderingInfo{
+        .sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
+        .pNext                = nullptr,
+        .flags                = 0,
+        .renderArea           = {{0, 0}, extent},
+        .layerCount           = 1,
+        .viewMask             = 0,
+        .colorAttachmentCount = 1,
+        .pColorAttachments    = &colorAttachment,
+        .pDepthAttachment     = nullptr,
+        .pStencilAttachment   = nullptr,
+    };
+    vkCmdBeginRendering(m_cmd, &renderingInfo);
+    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), m_cmd);
+    vkCmdEndRendering(m_cmd);
 }
 
 } // namespace rhi::vulkan

@@ -58,6 +58,7 @@ public:
     void clearBuffer(BufferHandle buffer) override;
     void dispatch(uint32_t gx, uint32_t gy, uint32_t gz) override;
     void blitToSwapchain(TextureHandle src) override;
+    void endUiFrame() override {} // no UI on this backend
 
 private:
     GlDevice&      m_device;
@@ -88,6 +89,13 @@ public:
     void destroy(BufferHandle handle) override;
     void destroy(ShaderHandle handle) override;
     void destroy(PipelineHandle handle) override;
+
+    // No ImGui overlay on this backend yet: report unavailable and the engine
+    // runs without one. The GL render backend would be a small addition, but
+    // the milestone only requires the overlay on Vulkan.
+    [[nodiscard]] bool initUi() override { return false; }
+    void               beginUiFrame() override {}
+    void               shutdownUi() override {}
 
 private:
     friend class GlCommandList;

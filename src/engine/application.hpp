@@ -4,6 +4,8 @@
 
 #include "engine/brick.hpp"
 #include "engine/camera.hpp"
+#include "engine/editor.hpp"
+#include "engine/render_mode.hpp"
 #include "engine/scene.hpp"
 #include "platform/window.hpp"
 #include "rhi/rhi.hpp"
@@ -13,14 +15,6 @@
 #include <string>
 
 namespace engine {
-
-// Which renderer produces the frame. The reference is the brute-force marcher
-// that defines correct; the brick renderer is the accelerated path validated
-// against it. Switchable at runtime.
-enum class RendererMode {
-    Brick,     // accelerated: marches the baked brick structure
-    Reference, // brute force: evaluates the whole edit list per step
-};
 
 struct AppConfig {
     uint32_t              width       = 1280;
@@ -38,6 +32,12 @@ struct AppConfig {
     RendererMode          renderer    = RendererMode::Brick;
     // 0 = shaded, 1 = step-count heat, 2 = brick/empty tint. Brick renderer only.
     int32_t               debugView   = 0;
+    // Show the Dear ImGui editor panel. Forced off for pinned verification runs
+    // (--dump / --compare) so the UI never lands in a compared image.
+    bool                  enableUi    = true;
+    // Load this scene file at startup instead of the built-in scene. Lets a
+    // saved arrangement be reproduced headlessly, e.g. for --dump / --compare.
+    std::filesystem::path scenePath;
 
     // Verification. When a dump or comparison is requested the animation clock
     // is pinned, otherwise two runs could never agree.
@@ -76,6 +76,11 @@ private:
     void recordBake(rhi::CommandList& cmd);
     void reportBakeStats();
     void handleRendererInput();
+    void uploadScene();
+
+    void initUi();
+    void shutdownUi();
+    void buildUi(); // issues the editor's ImGui:: calls and reacts to its actions
 
     void               writeDump(const std::filesystem::path& path);
     [[nodiscard]] bool compareAgainst(const std::filesystem::path& path);
@@ -140,23 +145,35 @@ private:
     rhi::TextureHandle  m_renderTarget = rhi::TextureHandle::Invalid;
     rhi::Extent2D       m_targetExtent = {};
 
-    // The edit list and its GPU mirror. Uploaded once: the scene is static for
-    // this milestone, and re-uploading is what an editor would add, not the
-    // renderer.
-    std::vector<GpuPrimitive> m_scene;
-    rhi::BufferHandle         m_sceneBuffer = rhi::BufferHandle::Invalid;
+    // The edit list — the single source of truth — and its GPU mirror. The
+    // buffer is allocated at kMaxPrimitives capacity so the editor can add
+    // primitives without reallocating it; only the active prefix is uploaded
+    // and only primitiveCount of it is evaluated.
+    static constexpr uint32_t     kMaxPrimitives = 256;
+    std::vector<GpuPrimitive>     m_scene;
+    rhi::BufferHandle             m_sceneBuffer = rhi::BufferHandle::Invalid;
 
     // The baked structure: dense top-level index, sparse brick pool, and the
     // bump-allocator / diagnostics block.
     rhi::BufferHandle m_cellsBuffer  = rhi::BufferHandle::Invalid;
     rhi::BufferHandle m_bricksBuffer = rhi::BufferHandle::Invalid;
     rhi::BufferHandle m_statsBuffer  = rhi::BufferHandle::Invalid;
-    bool              m_needBake     = true; // record the bake on the next frame
-    bool              m_bakePending  = false; // stats not yet read back
+    bool              m_needBake     = true;  // record the bake on the next frame
+    bool              m_bakePending  = false; // stats/time not yet read back
+    bool              m_measureBake  = true;  // time the next re-bake (first bake + committed edits)
+    float             m_lastBakeMs   = 0.0f;
+    bool              m_haveBake     = false; // a re-bake has been timed at least once
+    double            m_bakeStart    = 0.0;   // wall clock at the timed re-bake's submit
 
     RendererMode m_renderer     = RendererMode::Brick;
     int32_t      m_debugView    = 0;
     bool         m_debugKeyHeld = false;
+
+    // Editor UI.
+    Editor                m_editor;
+    bool                  m_uiEnabled = false;
+    std::filesystem::path m_sceneDir; // where scenes are saved/loaded from
+    float                 m_smoothedFrametime = 0.0f; // for a steady FPS readout
 
     FlyCamera m_camera;
     double    m_lastFrameTime = 0.0;

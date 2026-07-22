@@ -57,6 +57,15 @@ void Swapchain::build(VkExtent2D extent, VkSwapchainKHR oldSwapchain) {
     m_images = images.value();
     m_layouts.assign(m_images.size(), VK_IMAGE_LAYOUT_UNDEFINED);
 
+    // Colour-attachment views, used only by the ImGui overlay's dynamic
+    // rendering pass. vkb creates them to match the swapchain format.
+    auto views = m_swapchain.get_image_views();
+    if (!views) {
+        throw std::runtime_error("swapchain image view creation failed: " +
+                                 views.error().message());
+    }
+    m_views = views.value();
+
     // One presentation semaphore per swapchain image, not per frame in flight:
     // a frame-indexed semaphore can still be pending in the presentation
     // engine when it is reused, which the validation layers reject.
@@ -69,6 +78,8 @@ void Swapchain::build(VkExtent2D extent, VkSwapchainKHR oldSwapchain) {
 }
 
 void Swapchain::destroyImageResources() {
+    m_swapchain.destroy_image_views(m_views);
+    m_views.clear();
     for (VkSemaphore semaphore : m_renderFinished) {
         vkDestroySemaphore(m_device.device, semaphore, nullptr);
     }

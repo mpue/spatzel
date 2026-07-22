@@ -43,6 +43,7 @@ public:
     void clearBuffer(BufferHandle buffer) override;
     void dispatch(uint32_t gx, uint32_t gy, uint32_t gz) override;
     void blitToSwapchain(TextureHandle src) override;
+    void endUiFrame() override;
 
 private:
     struct PendingBinding {
@@ -90,6 +91,10 @@ public:
     void destroy(BufferHandle handle) override;
     void destroy(ShaderHandle handle) override;
     void destroy(PipelineHandle handle) override;
+
+    [[nodiscard]] bool initUi() override;
+    void               beginUiFrame() override;
+    void               shutdownUi() override;
 
 private:
     friend class VulkanCommandList;
@@ -147,6 +152,11 @@ private:
 
     // <shaderRoot>/vulkan — this backend's own SPIR-V variants.
     std::filesystem::path m_shaderDirectory;
+
+    // Dear ImGui render backend. Its own descriptor pool because ImGui manages
+    // its font and texture descriptors independently of the frame pools.
+    VkDescriptorPool m_uiDescriptorPool = VK_NULL_HANDLE;
+    bool             m_uiInitialised    = false;
 
     // Producer state of the swapchain image currently being written, so the
     // pre-present barrier knows what it has to wait for.

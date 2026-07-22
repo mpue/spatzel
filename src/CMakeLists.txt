@@ -17,11 +17,12 @@ target_include_directories(fitzel_rhi INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}")
 
 # The platform layer sees rhi.hpp only for rhi::WindowRequirements: a
 # client-API context must exist from window creation onwards and cannot be
-# attached later.
+# attached later. It also owns the ImGui GLFW backend — pure windowing glue,
+# no graphics API — so the input side of the UI stays in the platform layer.
 add_library(fitzel_platform STATIC
     platform/window.cpp)
 target_include_directories(fitzel_platform PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(fitzel_platform PUBLIC glfw fitzel_rhi PRIVATE fitzel_warnings)
+target_link_libraries(fitzel_platform PUBLIC glfw fitzel_rhi PRIVATE imgui_glfw fitzel_warnings)
 
 add_library(fitzel_rhi_factory STATIC
     rhi/factory.cpp)
@@ -33,19 +34,25 @@ if(FITZEL_WITH_VULKAN)
         rhi/vulkan/vk_swapchain.cpp
         rhi/vulkan/vk_device.cpp
         rhi/vulkan/vk_command_list.cpp
-        rhi/vulkan/vk_factory.cpp)
+        rhi/vulkan/vk_factory.cpp
+        # ImGui's Vulkan render backend. API-specific, so it lives with the
+        # Vulkan backend and nowhere above it.
+        "${FITZEL_IMGUI_BACKENDS_DIR}/imgui_impl_vulkan.cpp")
     target_link_libraries(fitzel_rhi_vulkan
         PUBLIC  fitzel_rhi
         PRIVATE volk
                 GPUOpen::VulkanMemoryAllocator
                 vk-bootstrap::vk-bootstrap
                 glfw
+                imgui
                 fitzel_warnings)
     # volk owns every entry point, so VMA must resolve its own through the two
-    # loader functions it is handed at allocator creation.
+    # loader functions it is handed at allocator creation. ImGui's Vulkan
+    # backend resolves its own through volk the same way.
     target_compile_definitions(fitzel_rhi_vulkan PRIVATE
         VMA_STATIC_VULKAN_FUNCTIONS=0
-        VMA_DYNAMIC_VULKAN_FUNCTIONS=1)
+        VMA_DYNAMIC_VULKAN_FUNCTIONS=1
+        IMGUI_IMPL_VULKAN_USE_VOLK)
 
     target_link_libraries(fitzel_rhi_factory PRIVATE fitzel_rhi_vulkan)
     target_compile_definitions(fitzel_rhi_factory PRIVATE FITZEL_WITH_VULKAN)
@@ -69,10 +76,12 @@ endif()
 add_library(fitzel_engine STATIC
     engine/application.cpp
     engine/camera.cpp
-    engine/scene.cpp)
+    engine/scene.cpp
+    engine/scene_io.cpp
+    engine/editor.cpp)
 target_link_libraries(fitzel_engine
     PUBLIC  fitzel_rhi fitzel_platform
-    PRIVATE fitzel_warnings)
+    PRIVATE imgui nlohmann_json::nlohmann_json fitzel_warnings)
 
 add_executable(fitzel main.cpp)
 target_link_libraries(fitzel PRIVATE fitzel_engine fitzel_rhi_factory fitzel_warnings)
@@ -83,3 +92,11 @@ endif()
 if(FITZEL_WITH_OPENGL)
     fitzel_stage_shaders(fitzel fitzel_shaders_opengl)
 endif()
+
+# Stage the example scenes next to the executable, where the editor's Examples
+# list looks and where relative --scene paths resolve.
+add_custom_command(TARGET fitzel POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_directory
+            "${CMAKE_SOURCE_DIR}/scenes" "$<TARGET_FILE_DIR:fitzel>/scenes"
+    COMMENT "Staging example scenes next to fitzel"
+    VERBATIM)

@@ -4,6 +4,12 @@
 // glfwCreateWindowSurface once the Vulkan types are visible.
 #include <GLFW/glfw3.h>
 
+// ImGui's Vulkan render backend. IMGUI_IMPL_VULKAN_USE_VOLK (set in CMake) makes
+// it resolve entry points through volk, the same loader the rest of this backend
+// uses. This is the only place ImGui's Vulkan symbols appear — below the seam.
+#include <imgui.h>
+#include <backends/imgui_impl_vulkan.h>
+
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -146,6 +152,10 @@ void VulkanDevice::selectDeviceAndQueue() {
     VkPhysicalDeviceVulkan13Features features13{};
     features13.sType            = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
     features13.synchronization2 = VK_TRUE;
+    // The ImGui overlay draws with dynamic rendering (no render pass object), so
+    // the feature has to be enabled on the device. The compute + blit render
+    // path itself uses neither, but the seam now offers the overlay.
+    features13.dynamicRendering  = VK_TRUE;
 
     vkb::PhysicalDeviceSelector selector(m_instance);
     auto selected = selector.set_surface(m_surface)
@@ -250,6 +260,8 @@ VulkanDevice::~VulkanDevice() {
     if (m_device.device != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(m_device.device);
     }
+
+    shutdownUi();
 
     // Anything the application forgot to destroy is cleaned up here so the
     // process exits without leaking device memory. Deferred deletions first:
@@ -943,6 +955,83 @@ void VulkanDevice::destroy(PipelineHandle handle) {
             vkDestroyDescriptorSetLayout(m_device.device, pipeline.setLayout, nullptr);
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// Debug UI overlay
+//
+// The ImGui context and every ImGui:: call live in the engine; this backend
+// only owns the Vulkan render backend. It draws with dynamic rendering (the
+// device already requires Vulkan 1.3), so there is no render pass or
+// framebuffer to manage — the overlay attaches directly to the swapchain image
+// view in CommandList::endUiFrame.
+// ---------------------------------------------------------------------------
+bool VulkanDevice::initUi() {
+    // ImGui manages its font (and any user texture) descriptors from its own
+    // pool, freeing sets as textures come and go — hence FREE_DESCRIPTOR_SET.
+    const VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8};
+    const VkDescriptorPoolCreateInfo poolInfo{
+        .sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .pNext         = nullptr,
+        .flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+        .maxSets       = 8,
+        .poolSizeCount = 1,
+        .pPoolSizes    = &poolSize,
+    };
+    FITZEL_CHECK(
+        vkCreateDescriptorPool(m_device.device, &poolInfo, nullptr, &m_uiDescriptorPool));
+
+    const VkFormat colorFormat = m_swapchain->format();
+    VkPipelineRenderingCreateInfo renderingInfo{
+        .sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+        .pNext                   = nullptr,
+        .viewMask                = 0,
+        .colorAttachmentCount    = 1,
+        .pColorAttachmentFormats = &colorFormat,
+        .depthAttachmentFormat   = VK_FORMAT_UNDEFINED,
+        .stencilAttachmentFormat = VK_FORMAT_UNDEFINED,
+    };
+
+    ImGui_ImplVulkan_InitInfo initInfo{};
+    initInfo.Instance                    = m_instance.instance;
+    initInfo.PhysicalDevice              = m_physicalDevice.physical_device;
+    initInfo.Device                      = m_device.device;
+    initInfo.QueueFamily                 = m_queueFamily;
+    initInfo.Queue                       = m_queue;
+    initInfo.DescriptorPool              = m_uiDescriptorPool;
+    initInfo.MinImageCount               = m_swapchain->imageCount();
+    initInfo.ImageCount                  = m_swapchain->imageCount();
+    initInfo.MSAASamples                 = VK_SAMPLE_COUNT_1_BIT;
+    initInfo.UseDynamicRendering         = true;
+    initInfo.PipelineRenderingCreateInfo = renderingInfo;
+
+    if (!ImGui_ImplVulkan_Init(&initInfo)) {
+        vkDestroyDescriptorPool(m_device.device, m_uiDescriptorPool, nullptr);
+        m_uiDescriptorPool = VK_NULL_HANDLE;
+        return false;
+    }
+    m_uiInitialised = true;
+    return true;
+}
+
+void VulkanDevice::beginUiFrame() {
+    if (m_uiInitialised) {
+        ImGui_ImplVulkan_NewFrame();
+    }
+}
+
+void VulkanDevice::shutdownUi() {
+    if (!m_uiInitialised) {
+        return;
+    }
+    // ImGui's device objects may still be referenced by frames in flight, so
+    // idle first. Safe to call from either the engine's ordered teardown or the
+    // destructor; the flag makes the second call a no-op.
+    vkDeviceWaitIdle(m_device.device);
+    ImGui_ImplVulkan_Shutdown();
+    vkDestroyDescriptorPool(m_device.device, m_uiDescriptorPool, nullptr);
+    m_uiDescriptorPool = VK_NULL_HANDLE;
+    m_uiInitialised    = false;
 }
 
 } // namespace rhi::vulkan
