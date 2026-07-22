@@ -18,7 +18,8 @@ using nlohmann::json;
 // format's contract, so it is spelled out here rather than derived from the
 // enum's numeric value.
 constexpr std::array<std::string_view, 4> kTypeNames{"Sphere", "Box", "Torus", "Plane"};
-constexpr std::array<std::string_view, 2> kOperatorNames{"Union", "SmoothUnion"};
+constexpr std::array<std::string_view, 4> kOperatorNames{"Union", "SmoothUnion", "Subtract",
+                                                         "Intersect"};
 
 std::string typeName(int32_t type) {
     if (type < 0 || type >= static_cast<int32_t>(kTypeNames.size())) {

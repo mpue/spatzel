@@ -34,6 +34,8 @@ const int kTypePlane  = 3;
 
 const int kOpUnion       = 0;
 const int kOpSmoothUnion = 1;
+const int kOpSubtract    = 2;
+const int kOpIntersect   = 3;
 
 #ifdef TARGET_VULKAN
 layout(set = 0, binding = 1, std430) readonly buffer Scene {
@@ -116,12 +118,17 @@ struct Hit {
     vec3  albedo;
 };
 
-// Folds the edit list into a single field. The list is data: nothing here
-// knows what is in it.
+// Folds the edit list into a single field, left to right: each primitive
+// combines with everything accumulated before it. The list is the CSG order —
+// a Subtract carves out what precedes it — which is why there is no separate
+// tree here; the flat list is the tree.
 //
-// smin is Lipschitz-continuous with constant 1, as is min, so the result is a
-// conservative distance bound everywhere — which is what both sphere tracing
-// and the bake's occupancy test rely on.
+// min, max and the polynomial smin are all Lipschitz-continuous with constant
+// 1, and negating an argument preserves that, so every operator below keeps the
+// result a conservative distance bound everywhere — which is exactly what both
+// sphere tracing and the bake's occupancy test rely on. The CSG operators
+// (max-based) can under-estimate distance near a seam, which only ever makes
+// tracing take a smaller, still-safe step.
 Hit sceneSdf(vec3 p, int primitiveCount) {
     Hit result;
     result.distance = 1e9;
@@ -130,12 +137,25 @@ Hit sceneSdf(vec3 p, int primitiveCount) {
     for (int i = 0; i < primitiveCount; ++i) {
         const Primitive prim = scene.primitives[i];
         const float     d    = evaluatePrimitive(p, prim);
+        const int       op   = prim.control.y;
 
-        if (prim.control.y == kOpSmoothUnion) {
+        if (op == kOpSmoothUnion) {
             const vec2 blended = smoothUnion(result.distance, d, prim.position.w);
             result.albedo   = mix(result.albedo, prim.albedo.rgb, blended.y);
             result.distance = blended.x;
-        } else {
+        } else if (op == kOpSubtract) {
+            // Carve this primitive out of the accumulated shape. The newly
+            // exposed walls keep the accumulated material — the cutter paints
+            // nothing.
+            result.distance = max(result.distance, -d);
+        } else if (op == kOpIntersect) {
+            // Keep only what is also inside this primitive. The binding surface
+            // is the farther of the two, so that one's material shows.
+            if (d > result.distance) {
+                result.albedo = prim.albedo.rgb;
+            }
+            result.distance = max(result.distance, d);
+        } else { // kOpUnion
             if (d < result.distance) {
                 result.albedo = prim.albedo.rgb;
             }

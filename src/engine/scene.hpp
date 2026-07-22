@@ -24,6 +24,8 @@ enum class PrimitiveType : int32_t {
 enum class Operator : int32_t {
     Union       = 0,
     SmoothUnion = 1,
+    Subtract    = 2, // max(acc, -d): carve this primitive out of what precedes it
+    Intersect   = 3, // max(acc,  d): keep only the overlap with what precedes it
 };
 
 // GPU layout. Every member is a 16-byte slot, which makes std430 (the storage

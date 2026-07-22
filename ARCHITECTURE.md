@@ -381,10 +381,22 @@ function, and the marcher either overshoots through surfaces or crawls.
 Translation and rotation are what an SDF primitive can carry exactly, so those
 are what the transform holds.
 
-Operators are `Union` and `SmoothUnion` (polynomial `smin`). `smin` returns its
-mix factor alongside the blended distance so the albedo can follow the same
-blend — which is what makes the transition zone legible instead of only
-visible in silhouette.
+Operators are `Union` (`min`), `SmoothUnion` (polynomial `smin`), `Subtract`
+(`max(acc, -d)`) and `Intersect` (`max(acc, d)`). `smin` returns its mix factor
+alongside the blended distance so the albedo can follow the same blend — which
+is what makes the transition zone legible instead of only visible in silhouette.
+
+Each primitive combines with everything accumulated **before** it, left to right
+— the edit list *is* the CSG expression, evaluated as a left fold. There is no
+grouping or tree (a non-goal), so `Subtract` and `Intersect` act on the whole
+running result, not on a neighbour: a subtracting sphere carves every solid it
+overlaps, and is kept local by placing it so it only overlaps its target and by
+ordering later unions after it. All four operators are 1-Lipschitz (negating an
+argument preserves that), so the field stays a conservative distance bound and
+the brick bake needs no change — the max-based CSG operators only ever
+under-estimate distance near a seam, which makes tracing take a smaller, still
+safe step. `Subtract`'s exposed walls keep the accumulated material; `Intersect`
+shows the material of whichever surface is the binding (farther) one.
 
 This is also the first real consumer of the RHI buffer API
 (`createBuffer` / `updateBuffer` / `bindStorageBuffer`), which had been carried

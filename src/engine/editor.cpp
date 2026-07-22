@@ -16,7 +16,8 @@ namespace engine {
 namespace {
 
 constexpr std::array<const char*, 4> kTypeNames{"Sphere", "Box", "Torus", "Plane"};
-constexpr std::array<const char*, 2> kOperatorNames{"Union", "SmoothUnion"};
+constexpr std::array<const char*, 4> kOperatorNames{"Union", "SmoothUnion", "Subtract",
+                                                    "Intersect"};
 
 constexpr size_t kMaxUndo = 128;
 
