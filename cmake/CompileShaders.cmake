@@ -29,9 +29,16 @@ message(STATUS "Shader compiler: ${FITZEL_GLSL_COMPILER}")
 #     SUBDIR <name>            staging subdirectory, i.e. the backend's name
 #     TARGET_ENV <env>         vulkan1.3 | opengl
 #     [DEFINES <macro>...]
+#     [INCLUDES <glsl>...]     shared #include files; rebuild triggers, not compiled
 #     SOURCES <glsl>...)
+#
+# Both compilers resolve `#include "foo.glsl"` relative to the including file,
+# and the shader tree is flat, so no -I is needed. glslc's -MD depfile already
+# records the includes it pulled in, so a changed include rebuilds every
+# dependent module. glslangValidator emits no depfile, so INCLUDES is added to
+# the command's DEPENDS by hand to get the same rebuild behaviour there.
 function(fitzel_add_shaders TARGET)
-    cmake_parse_arguments(ARG "" "TARGET_ENV;SUBDIR" "SOURCES;DEFINES" ${ARGN})
+    cmake_parse_arguments(ARG "" "TARGET_ENV;SUBDIR" "SOURCES;DEFINES;INCLUDES" ${ARGN})
 
     if(NOT ARG_TARGET_ENV)
         message(FATAL_ERROR "fitzel_add_shaders(${TARGET}): TARGET_ENV is required")
@@ -45,6 +52,12 @@ function(fitzel_add_shaders TARGET)
     set(_defines "")
     foreach(_define IN LISTS ARG_DEFINES)
         list(APPEND _defines "-D${_define}")
+    endforeach()
+
+    set(_include_deps "")
+    foreach(_inc IN LISTS ARG_INCLUDES)
+        get_filename_component(_inc_abs "${_inc}" ABSOLUTE)
+        list(APPEND _include_deps "${_inc_abs}")
     endforeach()
 
     set(_outputs "")
@@ -78,7 +91,7 @@ function(fitzel_add_shaders TARGET)
             OUTPUT "${_out}"
             COMMAND "${CMAKE_COMMAND}" -E make_directory "${_output_dir}"
             COMMAND ${_cmd}
-            DEPENDS "${_abs}"
+            DEPENDS "${_abs}" ${_include_deps}
             ${_depfile}
             COMMENT "SPIR-V ${ARG_SUBDIR}/${_name}"
             VERBATIM)

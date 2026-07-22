@@ -5,29 +5,16 @@
 // structure of any kind. That makes it the reference implementation. A faster
 // renderer is correct exactly insofar as it reproduces this one.
 //
+// The scene evaluation and the shading model live in shared includes
+// (sdf_scene.glsl, shading.glsl) so the brick bake and the brick marcher run
+// the identical code — a second copy would let "reproduces the reference"
+// quietly become "agrees with a different implementation".
+//
 // One source, two targets: the bodies below are identical and only the way
 // resources reach the shader differs, because Vulkan GLSL and OpenGL GLSL
 // disagree about that and nothing above the RHI seam may care.
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
-
-// Mirrors engine::GpuPrimitive. Every member is a 16-byte slot so std430 and
-// std140 agree and the C++ struct needs no padding arithmetic.
-struct Primitive {
-    vec4  position; // xyz, w = smooth-union blend radius
-    vec4  rotation; // unit quaternion
-    vec4  params;   // per type
-    vec4  albedo;   // rgb
-    ivec4 control;  // x = type, y = operator
-};
-
-const int kTypeSphere = 0;
-const int kTypeBox    = 1;
-const int kTypeTorus  = 2;
-const int kTypePlane  = 3;
-
-const int kOpUnion       = 0;
-const int kOpSmoothUnion = 1;
 
 #ifdef TARGET_VULKAN
 layout(set = 0, binding = 0, rgba16f) uniform writeonly image2D uOutput;
@@ -40,9 +27,6 @@ layout(push_constant) uniform Uniforms {
     int   primitiveCount;
     float padding;
 } u;
-layout(set = 0, binding = 1, std430) readonly buffer Scene {
-    Primitive primitives[];
-} scene;
 #else
 // OpenGL has no push constants. The backend maps the same byte blob onto a
 // uniform block; std140 and the push constant layout agree here because every
@@ -57,132 +41,12 @@ layout(binding = 0, std140) uniform Uniforms {
     int   primitiveCount;
     float padding;
 } u;
-layout(binding = 1, std430) readonly buffer Scene {
-    Primitive primitives[];
-} scene;
 #endif
 
-// --- primitives -------------------------------------------------------------
-
-// Rotate p by the inverse of a unit quaternion, i.e. take the world-space
-// sample point into the primitive's local frame.
-vec3 rotateInverse(vec3 p, vec4 q) {
-    const vec3 conjugate = -q.xyz;
-    const vec3 t = 2.0 * cross(conjugate, p);
-    return p + q.w * t + cross(conjugate, t);
-}
-
-float sdSphere(vec3 p, float radius) {
-    return length(p) - radius;
-}
-
-float sdRoundBox(vec3 p, vec3 halfExtents, float rounding) {
-    const vec3 q = abs(p) - halfExtents + rounding;
-    return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0) - rounding;
-}
-
-float sdTorus(vec3 p, float major, float minor) {
-    const vec2 q = vec2(length(p.xz) - major, p.y);
-    return length(q) - minor;
-}
-
-float sdPlane(vec3 p, vec3 normal, float offset) {
-    return dot(p, normal) + offset;
-}
-
-float evaluatePrimitive(vec3 worldPoint, Primitive prim) {
-    // A plane is defined in world space; everything else is defined in its own
-    // frame and reached by undoing the transform. There is no scale term,
-    // because a non-uniform scale would break the distance metric that sphere
-    // tracing relies on.
-    if (prim.control.x == kTypePlane) {
-        return sdPlane(worldPoint, normalize(prim.params.xyz), prim.params.w);
-    }
-
-    const vec3 local = rotateInverse(worldPoint - prim.position.xyz, prim.rotation);
-
-    if (prim.control.x == kTypeSphere) {
-        return sdSphere(local, prim.params.x);
-    }
-    if (prim.control.x == kTypeBox) {
-        return sdRoundBox(local, prim.params.xyz, prim.params.w);
-    }
-    if (prim.control.x == kTypeTorus) {
-        return sdTorus(local, prim.params.x, prim.params.y);
-    }
-    return 1e9;
-}
-
-// --- operators --------------------------------------------------------------
-
-// Polynomial smooth minimum. Returns the blended distance in .x and the mix
-// factor in .y so the albedo can follow the same blend — which is what makes
-// the transition zone legible rather than only visible in silhouette.
-vec2 smoothUnion(float a, float b, float k) {
-    if (k <= 0.0) {
-        return vec2(min(a, b), a < b ? 0.0 : 1.0);
-    }
-    const float h = clamp(0.5 + 0.5 * (a - b) / k, 0.0, 1.0);
-    return vec2(mix(a, b, h) - k * h * (1.0 - h), h);
-}
-
-// --- scene ------------------------------------------------------------------
-
-struct Hit {
-    float distance;
-    vec3  albedo;
-};
-
-// Folds the edit list into a single field. The list is data: nothing here
-// knows what is in it.
-Hit sceneSdf(vec3 p) {
-    Hit result;
-    result.distance = 1e9;
-    result.albedo   = vec3(0.8);
-
-    for (int i = 0; i < u.primitiveCount; ++i) {
-        const Primitive prim = scene.primitives[i];
-        const float     d    = evaluatePrimitive(p, prim);
-
-        if (prim.control.y == kOpSmoothUnion) {
-            const vec2 blended = smoothUnion(result.distance, d, prim.position.w);
-            result.albedo   = mix(result.albedo, prim.albedo.rgb, blended.y);
-            result.distance = blended.x;
-        } else {
-            if (d < result.distance) {
-                result.albedo = prim.albedo.rgb;
-            }
-            result.distance = min(result.distance, d);
-        }
-    }
-    return result;
-}
-
-float sceneDistance(vec3 p) {
-    return sceneSdf(p).distance;
-}
-
-// Central differences. Six evaluations of the whole list per shaded pixel,
-// which is exactly the cost this renderer is supposed to pay.
-vec3 sceneNormal(vec3 p) {
-    const float h = 0.0005;
-    return normalize(vec3(
-        sceneDistance(p + vec3(h, 0.0, 0.0)) - sceneDistance(p - vec3(h, 0.0, 0.0)),
-        sceneDistance(p + vec3(0.0, h, 0.0)) - sceneDistance(p - vec3(0.0, h, 0.0)),
-        sceneDistance(p + vec3(0.0, 0.0, h)) - sceneDistance(p - vec3(0.0, 0.0, h))));
-}
-
-// --- shading ----------------------------------------------------------------
-
-const vec3  kLightDirection = normalize(vec3(0.45, 0.8, 0.35));
-const vec3  kLightColour    = vec3(1.0, 0.97, 0.90);
-const vec3  kAmbientSky     = vec3(0.28, 0.33, 0.42);
-const vec3  kAmbientGround  = vec3(0.14, 0.12, 0.11);
-
-vec3 background(vec3 rayDirection) {
-    const float t = 0.5 * (rayDirection.y + 1.0);
-    return mix(vec3(0.13, 0.14, 0.17), vec3(0.42, 0.52, 0.68), clamp(t, 0.0, 1.0));
-}
+// The edit list (slot 1), the distance functions and the fold over the list.
+#include "sdf_scene.glsl"
+// The directional + hemispherical-ambient shading model.
+#include "shading.glsl"
 
 void main() {
     const ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
@@ -204,7 +68,7 @@ void main() {
                                         u.cameraUp.xyz * (ndc.y * tanHalfFov));
 
     // Sphere tracing.
-    const int   kMaxSteps   = 192;
+    const int   kMaxSteps    = 192;
     const float kMaxDistance = 90.0;
 
     float travelled = 0.0;
@@ -215,7 +79,7 @@ void main() {
 
     for (int step = 0; step < kMaxSteps; ++step) {
         const vec3 p = rayOrigin + rayDirection * travelled;
-        hit = sceneSdf(p);
+        hit = sceneSdf(p, u.primitiveCount);
 
         // The threshold widens with distance: a texel covers more world space
         // further out, so demanding a fixed epsilon there only wastes steps.
@@ -233,19 +97,8 @@ void main() {
     vec3 colour;
     if (found) {
         const vec3 position = rayOrigin + rayDirection * travelled;
-        const vec3 normal   = sceneNormal(position);
-
-        const float diffuse = max(dot(normal, kLightDirection), 0.0);
-        // Hemispherical ambient: sky above, bounce below. Cheap, and it keeps
-        // unlit faces from going flat black without any AO term.
-        const vec3 ambient = mix(kAmbientGround, kAmbientSky, 0.5 + 0.5 * normal.y);
-
-        colour = hit.albedo * (ambient + kLightColour * diffuse);
-
-        // Fade into the background so the unbounded ground plane does not end
-        // in a hard line at the march limit.
-        colour = mix(colour, background(rayDirection),
-                     clamp((travelled - 25.0) / 45.0, 0.0, 1.0));
+        const vec3 normal   = sceneNormal(position, u.primitiveCount);
+        colour = shadeHit(hit.albedo, normal, rayDirection, travelled);
     } else {
         colour = background(rayDirection);
     }
