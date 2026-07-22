@@ -758,9 +758,14 @@ presented image.
 Windows is the primary target and is what this was verified on. The CMake
 configuration is platform-neutral: no Windows SDK, no `WIN32` branches, no
 per-platform source lists. On Linux, GLFW needs the usual X11 and/or Wayland
-development packages at configure time. macOS is out of scope: MoltenVK for
-Vulkan, and OpenGL there is capped at 4.1 — no compute shaders — so the GL
-backend would need a different presentation path entirely.
+development packages at configure time.
+
+macOS runs the Vulkan backend through MoltenVK and has been verified on an
+Apple M5 Pro. The **OpenGL backend does not work on macOS** and is not expected
+to: Apple caps OpenGL at 4.1 — no compute shaders, no SPIR-V ingestion — while
+the loader is generated for `gl:core=4.6` and the renderer feeds SPIR-V, so
+`glfwCreateWindow` fails outright. Vulkan is the macOS path; a working GL
+backend there would need a different presentation path entirely.
 
 ## Build
 
@@ -782,6 +787,33 @@ CMake ≥ 3.24, all dependencies via `FetchContent` (pinned tags), C++20.
 
 The Vulkan SDK is required for the validation layers and for `glslc`; the
 Vulkan headers themselves come from `FetchContent`.
+
+Wrapper scripts drive a configure-once, build-Debug-and-Release flow:
+`build.ps1` (with the `build.cmd` shim) on Windows, `build.sh` on macOS and
+Linux. `build.sh` auto-selects Ninja or Unix Makefiles — single-config, so each
+configuration gets its own tree under `build/<Config>` — and also handles a
+multi-config generator (`Xcode`, `Ninja Multi-Config`) on the one-tree path.
+Both scripts take `--config`/`-Config`, `--clean`, `--no-vulkan`, `--no-opengl`.
+
+The project declares `LANGUAGES C CXX`: the third-party dependencies (GLFW,
+volk, the glad loader) are C, which the Visual Studio generator enables
+implicitly but Ninja/Make do not.
+
+On macOS the toolchain comes from Homebrew rather than the LunarG SDK:
+`brew install shaderc molten-vk vulkan-loader vulkan-tools` (`shaderc` provides
+`glslc`). Because Homebrew installs no SDK-wide environment file, running the
+Vulkan build needs two variables — set them once in your shell profile:
+
+```sh
+export VK_ICD_FILENAMES="/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json"
+export DYLD_FALLBACK_LIBRARY_PATH="/opt/homebrew/lib:/usr/local/lib:/usr/lib"
+```
+
+The first points the loader at the MoltenVK ICD (without it, "Found no
+drivers"); the second lets volk's `dlopen` of `libvulkan.1.dylib` find
+Homebrew's loader, which the default dyld search skips. `DYLD_FALLBACK_*` — not
+`DYLD_LIBRARY_PATH` — so it only applies when a library is otherwise unresolved
+and never shadows another program's libraries.
 
 ## How to add a third backend
 
