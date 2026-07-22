@@ -466,7 +466,17 @@ void VulkanDevice::collectGarbage() {
         if (m_deletionQueue[read].retireAfter <= m_frameCounter) {
             m_deletionQueue[read].deleter();
         } else {
-            m_deletionQueue[write++] = std::move(m_deletionQueue[read]);
+            // Guard the self-assignment: when no earlier entry has been retired,
+            // write == read and `x = std::move(x)` would run. libc++ empties a
+            // self-move-assigned std::function (it destroys the target before
+            // reading the source), so the deleter would be lost and invoked
+            // empty on a later frame — std::bad_function_call. This is the
+            // resize crash: the render target's deferred destroy is the usual
+            // producer here.
+            if (write != read) {
+                m_deletionQueue[write] = std::move(m_deletionQueue[read]);
+            }
+            ++write;
         }
     }
     m_deletionQueue.resize(write);
