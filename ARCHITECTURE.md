@@ -20,6 +20,12 @@ Three things in here are load-bearing:
 
 The first two exist to make the third safe rather than to be fast.
 
+On top of these sits an **editor**: a Dear ImGui panel that changes the scene at
+runtime and saves and loads it as JSON. It edits the parametric edit list
+directly — that list stays the single source of truth — and its UI reaches the
+screen through the same seam, so no graphics-API symbol crosses it for the UI
+either.
+
 ## The rule
 
 > No graphics API symbol may appear in `rhi.hpp` or in anything that includes
@@ -278,6 +284,16 @@ discipline the second backend established.
   source must carry `BufferUsage::CopySrc`. Both backends stage a device-local
   buffer through a host copy — on GL that also sidesteps the driver's
   video→host migration warning, keeping the bake free of debug messages.
+
+### And what the editor milestone added
+
+The debug UI overlay is the fourth seam addition: `Device::initUi` /
+`beginUiFrame` / `shutdownUi` and `CommandList::endUiFrame`, carrying no ImGui
+types. The engine drives Dear ImGui's neutral core; the backend owns the
+API-specific render backend and draws the built frame over the presented image.
+`initUi` returning false is a first-class outcome — the OpenGL backend does
+exactly that and the engine runs without an overlay. The full rationale is under
+"The editor".
 
 ## Vulkan backend
 
@@ -542,6 +558,106 @@ the bricks, and no performance-tuning pass. A dense top-level index over a
 bounded AABB is the whole of v1; the structural win is the point, not the
 numbers.
 
+---
+
+# The editor
+
+A panel to change the scene at runtime — select a primitive, edit its numbers,
+add and delete, undo/redo, and save/load — built so that an interesting or
+broken arrangement can be captured to a file and reproduced exactly.
+
+## The edit list stays the one source of truth
+
+The editor edits the `std::vector<GpuPrimitive>` the renderers already consume,
+in place. There is deliberately **no second scene representation**: no editor
+document, no node graph, no shadow copy that could drift from the list. The undo
+history is the one place whole-scene *snapshots* exist, and those are history,
+not an alternative present state — a parametric list makes a full snapshot cheap
+enough that this is the whole undo implementation.
+
+## Data flow
+
+```
+ImGui number field ─► GpuPrimitive in the edit list ─► scene storage buffer ─► renderer
+                                                    └─► (brick path) full re-bake
+```
+
+Every mutation — a committed field edit, an add/delete, an undo/redo, a load —
+does two things: re-upload the active prefix of the edit list to its storage
+buffer, and request a re-bake. The **reference renderer needs nothing else**; it
+re-evaluates the list every frame, so the change is simply visible next frame.
+The **brick renderer re-bakes in full** — there is no incremental or local
+re-bake here, on purpose. For the fixed-scale scenes this is a few milliseconds,
+reported in the panel.
+
+Two details make this usable rather than merely correct:
+
+- **The scene buffer is allocated at capacity** (`kMaxPrimitives`), not at the
+  current size. Adding a primitive never reallocates a GPU resource mid-frame;
+  only `primitiveCount` and the uploaded prefix change, and both renderers and
+  the bake already key off `primitiveCount`.
+- **A live drag re-bakes every frame but is not timed.** Timing the re-bake
+  means reading the bake stats back, which stalls the device; doing that every
+  frame of a drag would make dragging lurch. So the stats readback (and the
+  reported re-bake time) happens only on a *committed* edit — a released drag, an
+  add, a load — while the intermediate frames re-bake unmeasured. The brick image
+  still follows the drag live.
+
+## The UI seam
+
+Dear ImGui's core API is backend-neutral — its symbols are plain `ImGui::` — but
+its rendering is not. The split follows the same seam as everything else:
+
+- **The engine** owns the ImGui context and issues only `ImGui::` calls
+  (`CreateContext`, `NewFrame`, the widgets, `Render`). It names no graphics API.
+  `engine/editor.cpp` is entirely `ImGui::` and edit-list manipulation.
+- **`rhi.hpp`** carries four neutral hooks and no ImGui types:
+  `Device::initUi` (returns false if the backend has no overlay),
+  `Device::beginUiFrame`, `Device::shutdownUi`, and `CommandList::endUiFrame`
+  (draw the built frame over the presented image, after `blitToSwapchain`).
+- **The Vulkan backend** owns `imgui_impl_vulkan` and draws the overlay onto the
+  swapchain image with dynamic rendering — loading, not clearing, so it sits on
+  top of the blitted frame. This is why the swapchain now creates image views
+  and the device enables the `dynamicRendering` feature.
+- **The platform layer** owns `imgui_impl_glfw` — the input half, which is pure
+  windowing and touches no graphics API, so it belongs beside the window and not
+  behind the seam. When the pointer or keyboard is over the panel
+  (`io.WantCaptureMouse/Keyboard`) the engine withholds that input from the
+  camera and the renderer hotkeys.
+- **The OpenGL backend** returns false from `initUi` and the engine runs without
+  an overlay — the milestone only requires the UI on Vulkan, and this keeps the
+  non-UI backend building and running untouched. A GL overlay would be a small
+  addition (`imgui_impl_opengl3`), not a design change.
+
+No `imgui_impl_<api>` header is ever included above `src/rhi/<backend>/`, and the
+seam check passes unchanged: `ImGui`, `Ui`, and `imgui_impl_glfw` match none of
+its `vk[A-Z]` / `gl[A-Z]` / `GL_` patterns.
+
+## Scene files
+
+`engine/scene_io.cpp` writes and reads the edit list as JSON (nlohmann/json),
+with word-named types and operators so a person can read and hand-edit a file.
+Loading returns the same `std::vector<GpuPrimitive>` the renderer consumes —
+again, no second representation. Reproducibility is the point and is checked: a
+scene dumped from the built-in `buildScene()`, saved, and reloaded through
+`--scene` renders bit-identically (`max 0.000000`). Example scenes live in
+`scenes/` and are staged beside the executable; the editor's *Examples* list
+loads them with one click, and `--save-scene` seeds them from the canonical
+scene. The overlay is forced off during `--dump` / `--compare` so it never lands
+in a compared image — the accelerated-renderer A/B harness stays valid.
+
+## What this deliberately is not
+
+No picking in the viewport and no drag gizmos — selection is by list, editing by
+number field; both are natural later additions. No sculpting, brushes or
+destructive detail layers; no incremental re-bake; no material, light, mover or
+animation editing; no multi-select, copy/paste, grouping or asset browser; no
+docking or multi-window UI. Rotation is edited as a normalised quaternion rather
+than Euler angles or a gizmo, which keeps the schema unchanged. And there is no
+scale: the scene has no scale transform (a non-uniform one breaks the distance
+metric — see the renderer section), so a primitive's size is edited through its
+type-specific dimensions, not a transform.
+
 ## Camera and input
 
 `platform::InputState` is a neutral snapshot refreshed by `pollEvents`: key and
@@ -646,6 +762,11 @@ CMake ≥ 3.24, all dependencies via `FetchContent` (pinned tags), C++20.
   generated against
 - glad `v2.0.8` (gl:core=4.6, generated at configure time — requires Python 3)
 - GLFW `3.4`
+- Dear ImGui `v1.91.8` — the editor overlay. Ships no CMake of its own, so the
+  core and the GLFW backend are compiled into libraries here; the Vulkan render
+  backend is compiled inside `fitzel_rhi_vulkan` with `IMGUI_IMPL_VULKAN_USE_VOLK`
+  so it resolves entry points through volk like the rest of the backend.
+- nlohmann/json `v3.11.3` — human-readable scene files.
 
 The Vulkan SDK is required for the validation layers and for `glslc`; the
 Vulkan headers themselves come from `FetchContent`.
@@ -685,10 +806,18 @@ box — with live free-fly navigation:
   sparse structure. Runtime `1`/`2` switch renderers, `3` cycles the brick debug
   views; `--renderer` and `--debug-view` set them from the CLI.
 
+On Vulkan, the **editor overlay** runs on top: select a primitive from the list,
+edit its numbers, add/delete, undo/redo, switch renderer, and save/load scenes
+as JSON. Editing re-uploads the edit list and re-bakes the brick path live; the
+panel reports FPS, the active renderer and the last re-bake time. The OpenGL
+backend runs without the overlay, unchanged. `--scene` loads a scene file at
+startup and `--save-scene` writes one and exits.
+
 Reference-vs-brick agrees within the documented outlier tolerance
 (`--max-outlier-fraction`); the brick image is bit-identical across the two
-backends. Debug builds produce **zero Vulkan validation messages and zero GL
-debug messages** across the bake and both render paths.
+backends, and a saved scene reloads bit-identically. Debug builds produce **zero
+Vulkan validation messages and zero GL debug messages** across the bake, both
+render paths and the overlay.
 
 One build warning remains and is **not** from this work: MSVC emits `LNK4098`
 (a `LIBCMT` CRT-mix from a `FetchContent` dependency) on the Visual Studio
