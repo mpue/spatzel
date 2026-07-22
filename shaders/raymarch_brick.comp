@@ -1,0 +1,216 @@
+#version 450 core
+
+// Brick-accelerated raymarcher. Marches the sparse brick structure the bake
+// produced instead of the edit list: empty top-level cells are skipped whole,
+// and where a brick exists its trilinearly-sampled distance drives the sphere
+// trace. It shares the shading model with the reference renderer and consults
+// the edit list exactly once per shaded pixel — for the hit albedo only, since
+// bricks store distance, not material.
+//
+// Correct insofar as it reproduces the reference; the expected divergence is
+// the trilinear filter error at curved silhouettes, plus the band where the
+// infinite ground plane leaves the finite AABB. Both are documented in
+// ARCHITECTURE.md.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+#ifdef TARGET_VULKAN
+layout(set = 0, binding = 0, rgba16f) uniform writeonly image2D uOutput;
+layout(push_constant) uniform Uniforms {
+    vec4  cameraPosition; // xyz, w = tan(fovY / 2)
+    vec4  cameraRight;    // xyz, w = aspect
+    vec4  cameraUp;       // xyz, w = time
+    vec4  cameraForward;  // xyz
+    vec2  resolution;
+    int   primitiveCount;
+    int   debugMode;      // 0 = shaded, 1 = step heat, 2 = brick/empty tint
+    vec4  aabbMin;        // xyz
+    vec4  aabbMax;        // xyz
+} u;
+#else
+layout(binding = 0, rgba16f) uniform writeonly image2D uOutput;
+layout(binding = 0, std140) uniform Uniforms {
+    vec4  cameraPosition;
+    vec4  cameraRight;
+    vec4  cameraUp;
+    vec4  cameraForward;
+    vec2  resolution;
+    int   primitiveCount;
+    int   debugMode;
+    vec4  aabbMin;
+    vec4  aabbMax;
+} u;
+#endif
+
+#include "sdf_scene.glsl"   // scene edit list at slot 1 (albedo lookup only)
+#include "brick_common.glsl"
+#include "shading.glsl"
+
+#ifdef TARGET_VULKAN
+layout(set = 0, binding = 2, std430) readonly buffer Cells  { Cell  cells[]; };
+layout(set = 0, binding = 3, std430) readonly buffer Bricks { float bricks[]; };
+#else
+layout(binding = 2, std430) readonly buffer Cells  { Cell  cells[]; };
+layout(binding = 3, std430) readonly buffer Bricks { float bricks[]; };
+#endif
+
+// Trilinear read of a brick's distance field at world point p. The cell-centred
+// layout (see brick_common.glsl) maps cellMin to local coordinate kBrickApron
+// and cellMax to kBrickApron + kBrickInterior, so the 8 fetched samples always
+// lie inside this brick, apron included.
+float sampleBrick(int slot, vec3 p, vec3 cellMin, vec3 voxelStep) {
+    vec3 lv = (p - cellMin) / voxelStep + (float(kBrickApron) - 0.5);
+    lv = clamp(lv, vec3(0.0), vec3(float(kBrickSize - 1)));
+
+    ivec3 b = min(ivec3(floor(lv)), ivec3(kBrickSize - 2));
+    vec3  f = lv - vec3(b);
+
+    const int base = slot * kBrickVoxels;
+    #define BRICK_AT(dx, dy, dz) bricks[base + voxelLinearIndex(b + ivec3(dx, dy, dz))]
+    float c000 = BRICK_AT(0, 0, 0), c100 = BRICK_AT(1, 0, 0);
+    float c010 = BRICK_AT(0, 1, 0), c110 = BRICK_AT(1, 1, 0);
+    float c001 = BRICK_AT(0, 0, 1), c101 = BRICK_AT(1, 0, 1);
+    float c011 = BRICK_AT(0, 1, 1), c111 = BRICK_AT(1, 1, 1);
+    #undef BRICK_AT
+
+    float x00 = mix(c000, c100, f.x), x10 = mix(c010, c110, f.x);
+    float x01 = mix(c001, c101, f.x), x11 = mix(c011, c111, f.x);
+    float y0  = mix(x00, x10, f.y),   y1  = mix(x01, x11, f.y);
+    return mix(y0, y1, f.z);
+}
+
+// Normal as the gradient of the brick field. The half-voxel epsilon keeps every
+// sample within the brick's valid domain even at a hit on the cell boundary.
+vec3 brickNormal(int slot, vec3 p, vec3 cellMin, vec3 voxelStep) {
+    const vec3 e = 0.5 * voxelStep;
+    return normalize(vec3(
+        sampleBrick(slot, p + vec3(e.x, 0.0, 0.0), cellMin, voxelStep) -
+            sampleBrick(slot, p - vec3(e.x, 0.0, 0.0), cellMin, voxelStep),
+        sampleBrick(slot, p + vec3(0.0, e.y, 0.0), cellMin, voxelStep) -
+            sampleBrick(slot, p - vec3(0.0, e.y, 0.0), cellMin, voxelStep),
+        sampleBrick(slot, p + vec3(0.0, 0.0, e.z), cellMin, voxelStep) -
+            sampleBrick(slot, p - vec3(0.0, 0.0, e.z), cellMin, voxelStep)));
+}
+
+vec3 stepHeat(float t) {
+    // blue (few) -> green -> red (many), a cheap three-stop ramp.
+    t = clamp(t, 0.0, 1.0);
+    return clamp(vec3(2.0 * t, 1.0 - abs(2.0 * t - 1.0), 2.0 * (1.0 - t)), 0.0, 1.0);
+}
+
+void main() {
+    const ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    if (texel.x >= int(u.resolution.x) || texel.y >= int(u.resolution.y)) {
+        return;
+    }
+
+    vec2 ndc = ((vec2(texel) + 0.5) / u.resolution) * 2.0 - 1.0;
+    ndc.y = -ndc.y;
+
+    const float tanHalfFov = u.cameraPosition.w;
+    const float aspect     = u.cameraRight.w;
+
+    const vec3 ro = u.cameraPosition.xyz;
+    const vec3 rd = normalize(u.cameraForward.xyz +
+                              u.cameraRight.xyz * (ndc.x * aspect * tanHalfFov) +
+                              u.cameraUp.xyz * (ndc.y * tanHalfFov));
+
+    const vec3 aabbMin = u.aabbMin.xyz;
+    const vec3 aabbMax = u.aabbMax.xyz;
+    const vec3 cell    = cellSizeOf(aabbMin, aabbMax);
+
+    // A ray exactly parallel to an axis (rd component 0) makes invD infinite,
+    // and where such a ray also sits on a cell boundary the slab term becomes
+    // 0 * inf = NaN, which poisons the min/max and leaves a seam along that
+    // boundary. Nudging the component to a tiny finite value keeps invD finite
+    // without measurably bending the ray.
+    const vec3 rdSafe = mix(rd, vec3(1e-6), lessThan(abs(rd), vec3(1e-6)));
+
+    // Slab test against the whole grid AABB.
+    const vec3 invD = 1.0 / rdSafe;
+    const vec3 tA   = (aabbMin - ro) * invD;
+    const vec3 tB   = (aabbMax - ro) * invD;
+    const vec3 tlo  = min(tA, tB);
+    const vec3 thi  = max(tA, tB);
+    const float tEnter = max(max(tlo.x, tlo.y), tlo.z);
+    const float tExitBox = min(min(thi.x, thi.y), thi.z);
+
+    const int   kMaxSteps = 400;
+    const float kEps      = 0.001;
+
+    bool  found     = false;
+    int   hitSlot   = -1;
+    vec3  hitCellMin = vec3(0.0);
+    vec3  hitVoxel   = vec3(0.0);
+    float travelled  = 0.0;
+    int   steps      = 0;
+
+    if (tExitBox >= max(tEnter, 0.0)) {
+        float t = max(tEnter, 0.0) + kEps;
+        for (; steps < kMaxSteps; ++steps) {
+            if (t > tExitBox) {
+                break;
+            }
+            const vec3  p  = ro + rd * t;
+            ivec3 ci = ivec3(floor((p - aabbMin) / cell));
+            ci = clamp(ci, ivec3(0), ivec3(kGridRes - 1));
+
+            const vec3 cellMin = aabbMin + vec3(ci) * cell;
+            const vec3 cellMax = cellMin + cell;
+
+            // Distance along the ray to this cell's far face.
+            const vec3  ec = max((cellMin - ro) * invD, (cellMax - ro) * invD);
+            const float tCellExit = min(min(ec.x, ec.y), ec.z);
+
+            const Cell entry = cells[cellLinearIndex(ci)];
+            if (entry.brickSlot < 0) {
+                // Provably surface-free. Cross at least this cell; the centre
+                // distance is a Lipschitz-1 bound that may let us leap further.
+                const vec3  center = cellMin + 0.5 * cell;
+                const float safe   = abs(entry.emptyDistance) - length(p - center);
+                t += max(tCellExit - t + kEps, safe);
+            } else {
+                const vec3  voxelStep = cell / float(kBrickInterior);
+                const float d         = sampleBrick(entry.brickSlot, p, cellMin, voxelStep);
+                const float epsilon   = 0.0006 * max(t, 1.0);
+                if (d < epsilon) {
+                    found      = true;
+                    hitSlot    = entry.brickSlot;
+                    hitCellMin = cellMin;
+                    hitVoxel   = voxelStep;
+                    travelled  = t;
+                    break;
+                }
+                // Never step past this cell: the brick only describes surfaces
+                // within its own cell and apron, so a larger reported distance
+                // must not be trusted to leap over a neighbour's surface.
+                t = min(t + max(d, 0.25 * min(voxelStep.x, min(voxelStep.y, voxelStep.z))),
+                        tCellExit + kEps);
+            }
+        }
+    }
+
+    if (u.debugMode == 1) {
+        imageStore(uOutput, texel, vec4(stepHeat(float(steps) / float(kMaxSteps)), 1.0));
+        return;
+    }
+
+    vec3 colour;
+    if (found) {
+        const vec3 position = ro + rd * travelled;
+        const vec3 normal   = brickNormal(hitSlot, position, hitCellMin, hitVoxel);
+        // Bricks store distance only; the albedo comes from a single edit-list
+        // evaluation at the hit. Material is a non-goal, so this stays cheap.
+        const vec3 albedo = sceneSdf(position, u.primitiveCount).albedo;
+
+        if (u.debugMode == 2) {
+            colour = vec3(0.2, 0.9, 0.3); // hit inside a brick
+        } else {
+            colour = shadeHit(albedo, normal, rd, travelled);
+        }
+    } else {
+        colour = background(rd);
+    }
+
+    imageStore(uOutput, texel, vec4(colour, 1.0));
+}

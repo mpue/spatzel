@@ -13,10 +13,16 @@ void printUsage() {
     std::fprintf(stderr,
                  "usage: fitzel [options]\n"
                  "  --backend <vulkan|opengl>  graphics backend (default: vulkan)\n"
+                 "  --renderer <brick|reference>  renderer (default: brick)\n"
+                 "  --debug-view <0|1|2>       brick view: 0 shaded, 1 step heat, 2 brick tint\n"
                  "  --frames <n>               run n frames, then shut down normally\n"
                  "  --dump <file>              write the final frame for later comparison\n"
                  "  --compare <file>           compare the final frame against a dump\n"
-                 "  --tolerance <f>            per-component tolerance for --compare\n");
+                 "  --tolerance <f>            per-component tolerance for --compare\n"
+                 "  --max-outlier-fraction <f> pass --compare if at most this fraction of\n"
+                 "                             components exceed tolerance (default 0 = strict max)\n"
+                 "\n"
+                 "runtime keys: 1 reference, 2 brick, 3 cycle brick debug view\n");
 }
 
 bool parseBackend(std::string_view name, rhi::Backend& out) {
@@ -27,6 +33,18 @@ bool parseBackend(std::string_view name, rhi::Backend& out) {
     }
     if (name == "opengl") {
         out = rhi::Backend::OpenGL;
+        return true;
+    }
+    return false;
+}
+
+bool parseRenderer(std::string_view name, engine::RendererMode& out) {
+    if (name == "brick") {
+        out = engine::RendererMode::Brick;
+        return true;
+    }
+    if (name == "reference") {
+        out = engine::RendererMode::Reference;
         return true;
     }
     return false;
@@ -57,6 +75,14 @@ int main(int argc, char** argv) {
                     printUsage();
                     return 2;
                 }
+            } else if (arg == "--renderer" && hasValue) {
+                if (!parseRenderer(argv[++i], config.renderer)) {
+                    std::fprintf(stderr, "unknown renderer '%s'\n", argv[i]);
+                    printUsage();
+                    return 2;
+                }
+            } else if (arg == "--debug-view" && hasValue) {
+                config.debugView = static_cast<int32_t>(std::strtol(argv[++i], nullptr, 10));
             } else if (arg == "--frames" && hasValue) {
                 config.maxFrames = std::strtoull(argv[++i], nullptr, 10);
             } else if (arg == "--dump" && hasValue) {
@@ -65,6 +91,8 @@ int main(int argc, char** argv) {
                 config.comparePath = argv[++i];
             } else if (arg == "--tolerance" && hasValue) {
                 config.tolerance = std::strtof(argv[++i], nullptr);
+            } else if (arg == "--max-outlier-fraction" && hasValue) {
+                config.maxOutlierFraction = std::strtof(argv[++i], nullptr);
             } else {
                 std::fprintf(stderr, "unrecognised argument '%s'\n", argv[i]);
                 printUsage();

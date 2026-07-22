@@ -2,6 +2,7 @@
 
 // Engine layer. Sees rhi.hpp and the platform layer — never a backend.
 
+#include "engine/brick.hpp"
 #include "engine/camera.hpp"
 #include "engine/scene.hpp"
 #include "platform/window.hpp"
@@ -12,6 +13,14 @@
 #include <string>
 
 namespace engine {
+
+// Which renderer produces the frame. The reference is the brute-force marcher
+// that defines correct; the brick renderer is the accelerated path validated
+// against it. Switchable at runtime.
+enum class RendererMode {
+    Brick,     // accelerated: marches the baked brick structure
+    Reference, // brute force: evaluates the whole edit list per step
+};
 
 struct AppConfig {
     uint32_t              width       = 1280;
@@ -26,12 +35,22 @@ struct AppConfig {
     // Exists so an automated run can exercise the full startup/shutdown path.
     uint64_t              maxFrames   = 0;
 
+    RendererMode          renderer    = RendererMode::Brick;
+    // 0 = shaded, 1 = step-count heat, 2 = brick/empty tint. Brick renderer only.
+    int32_t               debugView   = 0;
+
     // Verification. When a dump or comparison is requested the animation clock
     // is pinned, otherwise two runs could never agree.
     std::filesystem::path dumpPath;
     std::filesystem::path comparePath;
     float                 fixedTime = 1.0f;
     float                 tolerance = 1.0f / 255.0f;
+    // Fraction of components allowed to exceed `tolerance` before --compare
+    // fails. The reference/brick A/B differs at curved silhouettes (trilinear
+    // filter error) and at the AABB ground boundary — a handful of pixels, not
+    // a max-error story — so the acceptance test is an outlier count, not a max.
+    // Default 0 keeps the strict cross-backend behaviour unchanged.
+    float                 maxOutlierFraction = 0.0f;
 };
 
 // Owns the window, the device and the milestone-1 compute probe pass.
@@ -50,6 +69,13 @@ private:
     void renderFrame();
     void resizeRenderTarget(rhi::Extent2D extent);
     void destroyRenderTarget();
+
+    void createBrickResources();
+    void recordReference(rhi::CommandList& cmd);
+    void recordBrick(rhi::CommandList& cmd);
+    void recordBake(rhi::CommandList& cmd);
+    void reportBakeStats();
+    void handleRendererInput();
 
     void               writeDump(const std::filesystem::path& path);
     [[nodiscard]] bool compareAgainst(const std::filesystem::path& path);
@@ -70,12 +96,47 @@ private:
     };
     static_assert(sizeof(SceneUniforms) == 80, "push constant block must stay under 128 bytes");
 
+    // Mirrors the push constant block in raymarch_brick.comp: the camera block
+    // above plus the debug view selector and the grid AABB.
+    struct BrickUniforms {
+        float   cameraPosition[4] = {};
+        float   cameraRight[4]    = {};
+        float   cameraUp[4]       = {};
+        float   cameraForward[4]  = {};
+        float   resolution[2]     = {};
+        int32_t primitiveCount    = 0;
+        int32_t debugMode         = 0;
+        float   aabbMin[4]        = {};
+        float   aabbMax[4]        = {};
+    };
+    static_assert(sizeof(BrickUniforms) == 112, "brick push constants must stay under 128 bytes");
+
+    // Mirrors the push constant block in the bake shaders.
+    struct BakeUniforms {
+        float   aabbMin[4] = {};
+        float   aabbMax[4] = {};
+        int32_t control[4] = {}; // x = primitiveCount, y = pool capacity
+    };
+    static_assert(sizeof(BakeUniforms) == 48, "bake push constants must stay under 128 bytes");
+
+    [[nodiscard]] SceneUniforms cameraUniforms() const;
+
     platform::Window             m_window;
     std::string                  m_shaderRoot;
     std::unique_ptr<rhi::Device> m_device;
 
-    rhi::ShaderHandle   m_shader       = rhi::ShaderHandle::Invalid;
-    rhi::PipelineHandle m_pipeline     = rhi::PipelineHandle::Invalid;
+    // Reference renderer (brute-force marcher over the edit list).
+    rhi::ShaderHandle   m_refShader   = rhi::ShaderHandle::Invalid;
+    rhi::PipelineHandle m_refPipeline = rhi::PipelineHandle::Invalid;
+
+    // Brick renderer and its bake passes.
+    rhi::ShaderHandle   m_brickShader      = rhi::ShaderHandle::Invalid;
+    rhi::PipelineHandle m_brickPipeline    = rhi::PipelineHandle::Invalid;
+    rhi::ShaderHandle   m_classifyShader   = rhi::ShaderHandle::Invalid;
+    rhi::PipelineHandle m_classifyPipeline = rhi::PipelineHandle::Invalid;
+    rhi::ShaderHandle   m_fillShader       = rhi::ShaderHandle::Invalid;
+    rhi::PipelineHandle m_fillPipeline     = rhi::PipelineHandle::Invalid;
+
     rhi::TextureHandle  m_renderTarget = rhi::TextureHandle::Invalid;
     rhi::Extent2D       m_targetExtent = {};
 
@@ -85,6 +146,18 @@ private:
     std::vector<GpuPrimitive> m_scene;
     rhi::BufferHandle         m_sceneBuffer = rhi::BufferHandle::Invalid;
 
+    // The baked structure: dense top-level index, sparse brick pool, and the
+    // bump-allocator / diagnostics block.
+    rhi::BufferHandle m_cellsBuffer  = rhi::BufferHandle::Invalid;
+    rhi::BufferHandle m_bricksBuffer = rhi::BufferHandle::Invalid;
+    rhi::BufferHandle m_statsBuffer  = rhi::BufferHandle::Invalid;
+    bool              m_needBake     = true; // record the bake on the next frame
+    bool              m_bakePending  = false; // stats not yet read back
+
+    RendererMode m_renderer     = RendererMode::Brick;
+    int32_t      m_debugView    = 0;
+    bool         m_debugKeyHeld = false;
+
     FlyCamera m_camera;
     double    m_lastFrameTime = 0.0;
 
@@ -93,9 +166,10 @@ private:
 
     std::filesystem::path m_dumpPath;
     std::filesystem::path m_comparePath;
-    bool                  m_pinTime   = false;
-    float                 m_fixedTime = 1.0f;
-    float                 m_tolerance = 1.0f / 255.0f;
+    bool                  m_pinTime            = false;
+    float                 m_fixedTime          = 1.0f;
+    float                 m_tolerance          = 1.0f / 255.0f;
+    float                 m_maxOutlierFraction = 0.0f;
 };
 
 } // namespace engine

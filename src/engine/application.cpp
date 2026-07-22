@@ -35,12 +35,15 @@ Application::Application(const AppConfig& config)
                 .title    = config.title,
                 .graphics = rhi::windowRequirements(config.backend, config.enableDebug)}),
       m_shaderRoot(config.shaderRoot.string()),
+      m_renderer(config.renderer),
+      m_debugView(config.debugView),
       m_maxFrames(config.maxFrames),
       m_dumpPath(config.dumpPath),
       m_comparePath(config.comparePath),
       m_pinTime(!config.dumpPath.empty() || !config.comparePath.empty()),
       m_fixedTime(config.fixedTime),
-      m_tolerance(config.tolerance) {
+      m_tolerance(config.tolerance),
+      m_maxOutlierFraction(config.maxOutlierFraction) {
     const platform::Extent2D framebuffer = m_window.framebufferSize();
 
     m_device = rhi::createDevice(config.backend,
@@ -52,10 +55,8 @@ Application::Application(const AppConfig& config)
                                      .shaderRoot         = m_shaderRoot.c_str(),
                                  });
 
-    m_shader = m_device->createShader("raymarch");
-
-    // The scene lives in a storage buffer and is uploaded once. Slot 0 is the
-    // render target, slot 1 the edit list.
+    // The scene lives in a storage buffer and is uploaded once. Both the
+    // renderers and the bake read it at slot 1.
     m_scene = buildScene();
     m_sceneBuffer = m_device->createBuffer({
         .size      = m_scene.size() * sizeof(GpuPrimitive),
@@ -68,31 +69,109 @@ Application::Application(const AppConfig& config)
         std::span<const std::byte>(reinterpret_cast<const std::byte*>(m_scene.data()),
                                    m_scene.size() * sizeof(GpuPrimitive)));
 
-    constexpr std::array<rhi::BindingDesc, 2> bindings{
+    // --- reference renderer: render target (slot 0) + edit list (slot 1) ----
+    m_refShader = m_device->createShader("raymarch");
+    constexpr std::array<rhi::BindingDesc, 2> refBindings{
         rhi::BindingDesc{.slot = 0, .type = rhi::BindingType::StorageTexture},
         rhi::BindingDesc{.slot = 1, .type = rhi::BindingType::StorageBuffer}};
-    m_pipeline = m_device->createComputePipeline({
-        .cs               = m_shader,
+    m_refPipeline = m_device->createComputePipeline({
+        .cs               = m_refShader,
         .pushConstantSize = sizeof(SceneUniforms),
-        .bindings         = bindings,
-        .debugName        = "raymarch",
+        .bindings         = refBindings,
+        .debugName        = "raymarch_reference",
     });
 
+    createBrickResources();
+
     resizeRenderTarget(m_device->swapchainExtent());
+}
+
+void Application::createBrickResources() {
+    // Dense top-level index. GpuOnly, CopySrc so it can be inspected.
+    m_cellsBuffer = m_device->createBuffer({
+        .size      = static_cast<uint64_t>(brick::kCellCount) * sizeof(brick::Cell),
+        .usage     = rhi::BufferUsage::Storage | rhi::BufferUsage::CopySrc,
+        .access    = rhi::MemoryAccess::GpuOnly,
+        .debugName = "brick_cells",
+    });
+    // Sparse brick pool.
+    m_bricksBuffer = m_device->createBuffer({
+        .size = static_cast<uint64_t>(brick::kPoolCapacity) * brick::kBrickVoxels * sizeof(float),
+        .usage     = rhi::BufferUsage::Storage | rhi::BufferUsage::CopySrc,
+        .access    = rhi::MemoryAccess::GpuOnly,
+        .debugName = "brick_pool",
+    });
+    // The bump allocator / diagnostics block. Device-local: the atomics want it
+    // there, it is zeroed on the GPU by the bake (clearBuffer, hence CopyDst),
+    // and the readback stages it out through a host copy (hence CopySrc).
+    m_statsBuffer = m_device->createBuffer({
+        .size  = sizeof(brick::BakeStats),
+        .usage = rhi::BufferUsage::Storage | rhi::BufferUsage::CopySrc | rhi::BufferUsage::CopyDst,
+        .access    = rhi::MemoryAccess::GpuOnly,
+        .debugName = "brick_bake_stats",
+    });
+
+    m_classifyShader = m_device->createShader("bake_classify");
+    constexpr std::array<rhi::BindingDesc, 3> classifyBindings{
+        rhi::BindingDesc{.slot = 1, .type = rhi::BindingType::StorageBuffer}, // scene
+        rhi::BindingDesc{.slot = 2, .type = rhi::BindingType::StorageBuffer}, // cells
+        rhi::BindingDesc{.slot = 4, .type = rhi::BindingType::StorageBuffer}, // stats
+    };
+    m_classifyPipeline = m_device->createComputePipeline({
+        .cs               = m_classifyShader,
+        .pushConstantSize = sizeof(BakeUniforms),
+        .bindings         = classifyBindings,
+        .debugName        = "bake_classify",
+    });
+
+    m_fillShader = m_device->createShader("bake_fill");
+    constexpr std::array<rhi::BindingDesc, 3> fillBindings{
+        rhi::BindingDesc{.slot = 1, .type = rhi::BindingType::StorageBuffer}, // scene
+        rhi::BindingDesc{.slot = 2, .type = rhi::BindingType::StorageBuffer}, // cells
+        rhi::BindingDesc{.slot = 3, .type = rhi::BindingType::StorageBuffer}, // bricks
+    };
+    m_fillPipeline = m_device->createComputePipeline({
+        .cs               = m_fillShader,
+        .pushConstantSize = sizeof(BakeUniforms),
+        .bindings         = fillBindings,
+        .debugName        = "bake_fill",
+    });
+
+    m_brickShader = m_device->createShader("raymarch_brick");
+    constexpr std::array<rhi::BindingDesc, 4> brickBindings{
+        rhi::BindingDesc{.slot = 0, .type = rhi::BindingType::StorageTexture}, // output
+        rhi::BindingDesc{.slot = 1, .type = rhi::BindingType::StorageBuffer},  // scene
+        rhi::BindingDesc{.slot = 2, .type = rhi::BindingType::StorageBuffer},  // cells
+        rhi::BindingDesc{.slot = 3, .type = rhi::BindingType::StorageBuffer},  // bricks
+    };
+    m_brickPipeline = m_device->createComputePipeline({
+        .cs               = m_brickShader,
+        .pushConstantSize = sizeof(BrickUniforms),
+        .bindings         = brickBindings,
+        .debugName        = "raymarch_brick",
+    });
 }
 
 Application::~Application() {
     // No idle wait: destruction is safe to request at any time, and a backend
     // that can still have work in flight defers the release itself.
     destroyRenderTarget();
-    if (rhi::isValid(m_sceneBuffer)) {
-        m_device->destroy(m_sceneBuffer);
+    for (rhi::BufferHandle buffer : {m_sceneBuffer, m_cellsBuffer, m_bricksBuffer, m_statsBuffer}) {
+        if (rhi::isValid(buffer)) {
+            m_device->destroy(buffer);
+        }
     }
-    if (rhi::isValid(m_pipeline)) {
-        m_device->destroy(m_pipeline);
+    for (rhi::PipelineHandle pipeline :
+         {m_refPipeline, m_brickPipeline, m_classifyPipeline, m_fillPipeline}) {
+        if (rhi::isValid(pipeline)) {
+            m_device->destroy(pipeline);
+        }
     }
-    if (rhi::isValid(m_shader)) {
-        m_device->destroy(m_shader);
+    for (rhi::ShaderHandle shader :
+         {m_refShader, m_brickShader, m_classifyShader, m_fillShader}) {
+        if (rhi::isValid(shader)) {
+            m_device->destroy(shader);
+        }
     }
 }
 
@@ -118,6 +197,32 @@ void Application::destroyRenderTarget() {
         m_device->destroy(m_renderTarget);
         m_renderTarget = rhi::TextureHandle::Invalid;
         m_targetExtent = {};
+    }
+}
+
+// Runtime switch between the two renderers, and a cycle through the brick
+// renderer's debug views. Edge-triggered would need previous-frame state; a
+// level check is enough here because a held key just re-selects the same mode.
+void Application::handleRendererInput() {
+    const platform::InputState& in = m_window.input();
+    if (in.isDown(platform::Key::Num1) && m_renderer != RendererMode::Reference) {
+        m_renderer = RendererMode::Reference;
+        std::fprintf(stderr, "[renderer] reference (brute force)\n");
+    }
+    if (in.isDown(platform::Key::Num2) && m_renderer != RendererMode::Brick) {
+        m_renderer = RendererMode::Brick;
+        std::fprintf(stderr, "[renderer] brick\n");
+    }
+    if (in.isDown(platform::Key::Num3)) {
+        // Debounced by requiring release between presses.
+        if (!m_debugKeyHeld) {
+            m_debugView    = (m_debugView + 1) % 3;
+            m_debugKeyHeld = true;
+            static const char* names[] = {"shaded", "step heat", "brick tint"};
+            std::fprintf(stderr, "[renderer] brick debug view: %s\n", names[m_debugView]);
+        }
+    } else {
+        m_debugKeyHeld = false;
     }
 }
 
@@ -150,9 +255,11 @@ bool Application::run() {
         m_lastFrameTime = now;
 
         // A pinned run has to be reproducible, and a free-flying camera is
-        // not. Same reasoning as the pinned clock.
+        // not. Same reasoning as the pinned clock. Renderer switching is frozen
+        // too, so a comparison run renders exactly the requested path.
         if (!m_pinTime) {
             m_camera.update(m_window.input(), deltaSeconds);
+            handleRendererInput();
         }
 
         renderFrame();
@@ -183,6 +290,33 @@ void Application::renderFrame() {
     // recording is fine: destruction is deferred past the frames in flight.
     resizeRenderTarget(m_device->swapchainExtent());
 
+    // The bake is full and static, recorded once ahead of the first frame's
+    // marcher. The dispatch-ordering guarantee makes the marcher in this same
+    // command list see what the bake wrote.
+    if (m_needBake) {
+        recordBake(cmd);
+        m_needBake    = false;
+        m_bakePending = true;
+    }
+
+    if (m_renderer == RendererMode::Reference) {
+        recordReference(cmd);
+    } else {
+        recordBrick(cmd);
+    }
+    cmd.blitToSwapchain(m_renderTarget);
+
+    m_device->endFrame();
+
+    // Now the bake dispatches have been submitted, so their stats can be read
+    // back (readBuffer stalls the device until they complete).
+    if (m_bakePending) {
+        reportBakeStats();
+        m_bakePending = false;
+    }
+}
+
+Application::SceneUniforms Application::cameraUniforms() const {
     const Vec3  position = m_camera.position();
     const Vec3  right    = m_camera.right();
     const Vec3  up       = m_camera.up();
@@ -190,7 +324,7 @@ void Application::renderFrame() {
     const float aspect   = static_cast<float>(m_targetExtent.width) /
                          static_cast<float>(m_targetExtent.height);
 
-    const SceneUniforms uniforms{
+    return SceneUniforms{
         .cameraPosition = {position.x, position.y, position.z,
                            std::tan(m_camera.verticalFovRadians() * 0.5f)},
         .cameraRight    = {right.x, right.y, right.z, aspect},
@@ -201,16 +335,97 @@ void Application::renderFrame() {
                            static_cast<float>(m_targetExtent.height)},
         .primitiveCount = static_cast<int32_t>(m_scene.size()),
     };
+}
 
-    cmd.bindComputePipeline(m_pipeline);
+void Application::recordReference(rhi::CommandList& cmd) {
+    const SceneUniforms uniforms = cameraUniforms();
+    cmd.bindComputePipeline(m_refPipeline);
     cmd.bindStorageTexture(0, m_renderTarget);
     cmd.bindStorageBuffer(1, m_sceneBuffer);
     cmd.pushConstants(asBytes(uniforms));
     cmd.dispatch(divideRoundUp(m_targetExtent.width, kWorkgroupSize),
                  divideRoundUp(m_targetExtent.height, kWorkgroupSize), 1);
-    cmd.blitToSwapchain(m_renderTarget);
+}
 
-    m_device->endFrame();
+void Application::recordBrick(rhi::CommandList& cmd) {
+    const SceneUniforms cam = cameraUniforms();
+    BrickUniforms       uniforms{};
+    std::memcpy(uniforms.cameraPosition, cam.cameraPosition, sizeof(cam.cameraPosition));
+    std::memcpy(uniforms.cameraRight, cam.cameraRight, sizeof(cam.cameraRight));
+    std::memcpy(uniforms.cameraUp, cam.cameraUp, sizeof(cam.cameraUp));
+    std::memcpy(uniforms.cameraForward, cam.cameraForward, sizeof(cam.cameraForward));
+    uniforms.resolution[0]  = cam.resolution[0];
+    uniforms.resolution[1]  = cam.resolution[1];
+    uniforms.primitiveCount = cam.primitiveCount;
+    uniforms.debugMode      = m_debugView;
+    uniforms.aabbMin[0]     = brick::kAabbMin.x;
+    uniforms.aabbMin[1]     = brick::kAabbMin.y;
+    uniforms.aabbMin[2]     = brick::kAabbMin.z;
+    uniforms.aabbMax[0]     = brick::kAabbMax.x;
+    uniforms.aabbMax[1]     = brick::kAabbMax.y;
+    uniforms.aabbMax[2]     = brick::kAabbMax.z;
+
+    cmd.bindComputePipeline(m_brickPipeline);
+    cmd.bindStorageTexture(0, m_renderTarget);
+    cmd.bindStorageBuffer(1, m_sceneBuffer);
+    cmd.bindStorageBuffer(2, m_cellsBuffer);
+    cmd.bindStorageBuffer(3, m_bricksBuffer);
+    cmd.pushConstants(asBytes(uniforms));
+    cmd.dispatch(divideRoundUp(m_targetExtent.width, kWorkgroupSize),
+                 divideRoundUp(m_targetExtent.height, kWorkgroupSize), 1);
+}
+
+void Application::recordBake(rhi::CommandList& cmd) {
+    BakeUniforms uniforms{};
+    uniforms.aabbMin[0] = brick::kAabbMin.x;
+    uniforms.aabbMin[1] = brick::kAabbMin.y;
+    uniforms.aabbMin[2] = brick::kAabbMin.z;
+    uniforms.aabbMax[0] = brick::kAabbMax.x;
+    uniforms.aabbMax[1] = brick::kAabbMax.y;
+    uniforms.aabbMax[2] = brick::kAabbMax.z;
+    uniforms.control[0] = static_cast<int32_t>(m_scene.size());
+    uniforms.control[1] = brick::kPoolCapacity;
+
+    // Zero the bump counter / diagnostics before the atomics touch it. The
+    // ordering guarantee makes it visible to the classify dispatch below.
+    cmd.clearBuffer(m_statsBuffer);
+
+    // Pass 1: classify each cell and bump-allocate brick slots.
+    cmd.bindComputePipeline(m_classifyPipeline);
+    cmd.bindStorageBuffer(1, m_sceneBuffer);
+    cmd.bindStorageBuffer(2, m_cellsBuffer);
+    cmd.bindStorageBuffer(4, m_statsBuffer);
+    cmd.pushConstants(asBytes(uniforms));
+    cmd.dispatch(divideRoundUp(brick::kGridRes, 4), divideRoundUp(brick::kGridRes, 4),
+                 divideRoundUp(brick::kGridRes, 4));
+
+    // Pass 2: fill each occupied cell's brick. One workgroup per cell, one
+    // thread per voxel; empty cells early-out. Ordering is the seam's promise.
+    cmd.bindComputePipeline(m_fillPipeline);
+    cmd.bindStorageBuffer(1, m_sceneBuffer);
+    cmd.bindStorageBuffer(2, m_cellsBuffer);
+    cmd.bindStorageBuffer(3, m_bricksBuffer);
+    cmd.pushConstants(asBytes(uniforms));
+    cmd.dispatch(brick::kGridRes, brick::kGridRes, brick::kGridRes);
+}
+
+void Application::reportBakeStats() {
+    brick::BakeStats stats{};
+    m_device->readBuffer(m_statsBuffer,
+                         std::span<std::byte>(reinterpret_cast<std::byte*>(&stats), sizeof(stats)));
+
+    const double occupancy =
+        100.0 * static_cast<double>(stats.bricksRequested) / static_cast<double>(brick::kCellCount);
+    std::fprintf(stderr,
+                 "[bake] %u/%d cells occupied (%.1f%%), pool capacity %d, overflow %u\n",
+                 stats.bricksRequested, brick::kCellCount, occupancy, brick::kPoolCapacity,
+                 stats.overflowCount);
+    if (stats.overflowCount != 0) {
+        std::fprintf(stderr,
+                     "[bake] WARNING: brick pool overflowed by %u slots — raise kPoolCapacity or "
+                     "shrink the AABB; the brick field is incomplete.\n",
+                     stats.overflowCount);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -293,11 +508,23 @@ bool Application::compareAgainst(const std::filesystem::path& path) {
         overCount += diff > m_tolerance ? 1 : 0;
     }
 
-    const bool passed = maxDiff <= m_tolerance;
+    // Two acceptance criteria. The cross-backend test wants max error within
+    // tolerance — every component agrees. The reference/brick A/B cannot meet
+    // that: a curved silhouette shifts by a sub-pixel under the trilinear field
+    // and the infinite ground plane leaves the finite AABB, so a small set of
+    // components legitimately exceed tolerance while the image as a whole
+    // matches. maxOutlierFraction names how large that set may be; at its
+    // default of 0 the strict max test is unchanged.
+    const double outlierFraction = static_cast<double>(overCount) / static_cast<double>(count);
+    const bool   passed = (m_maxOutlierFraction > 0.0f)
+                              ? outlierFraction <= static_cast<double>(m_maxOutlierFraction)
+                              : maxDiff <= m_tolerance;
     std::fprintf(stderr,
-                 "[compare] %s — max %.6f, mean %.6f, %zu/%zu components over tolerance %.6f\n",
+                 "[compare] %s — max %.6f, mean %.6f, %zu/%zu (%.4f%%) components over tolerance "
+                 "%.6f, outlier budget %.4f%%\n",
                  passed ? "PASS" : "FAIL", static_cast<double>(maxDiff), sumDiff / double(count),
-                 overCount, count, static_cast<double>(m_tolerance));
+                 overCount, count, 100.0 * outlierFraction, static_cast<double>(m_tolerance),
+                 100.0 * static_cast<double>(m_maxOutlierFraction));
     return passed;
 }
 

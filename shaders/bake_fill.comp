@@ -1,0 +1,55 @@
+#version 450 core
+
+// Bake pass 2 of 2 — voxel fill.
+//
+// One workgroup per top-level cell, one thread per brick voxel. Cells the
+// classify pass left empty return immediately; occupied cells sample the shared
+// scene SDF at each voxel's world position and write it into the cell's brick.
+//
+// Relies on the dispatch-ordering guarantee in rhi.hpp: every cell decision the
+// classify pass wrote is visible here.
+
+layout(local_size_x = 10, local_size_y = 10, local_size_z = 10) in; // kBrickSize^3
+
+#ifdef TARGET_VULKAN
+layout(push_constant) uniform Bake {
+    vec4  aabbMin;
+    vec4  aabbMax;
+    ivec4 control; // x = primitiveCount, y = pool capacity (unused here)
+} u;
+#else
+layout(binding = 0, std140) uniform Bake {
+    vec4  aabbMin;
+    vec4  aabbMax;
+    ivec4 control;
+} u;
+#endif
+
+#include "sdf_scene.glsl"   // scene edit list at slot 1
+#include "brick_common.glsl"
+
+#ifdef TARGET_VULKAN
+layout(set = 0, binding = 2, std430) readonly buffer Cells { Cell cells[]; };
+layout(set = 0, binding = 3, std430) buffer Bricks { float bricks[]; };
+#else
+layout(binding = 2, std430) readonly buffer Cells { Cell cells[]; };
+layout(binding = 3, std430) buffer Bricks { float bricks[]; };
+#endif
+
+void main() {
+    const ivec3 c   = ivec3(gl_WorkGroupID); // one workgroup per cell, kGridRes^3 dispatched
+    const int   idx = cellLinearIndex(c);
+    const Cell  cell = cells[idx];
+    if (cell.brickSlot < 0) {
+        return; // empty cell: no brick to fill
+    }
+
+    const ivec3 v         = ivec3(gl_LocalInvocationID); // 0..kBrickSize-1
+    const vec3  step      = cellSizeOf(u.aabbMin.xyz, u.aabbMax.xyz);
+    const vec3  cellMin   = u.aabbMin.xyz + vec3(c) * step;
+    const vec3  voxelStep = step / float(kBrickInterior);
+    const vec3  p         = voxelWorldPos(cellMin, voxelStep, v);
+
+    const float d = sceneSdf(p, u.control.x).distance;
+    bricks[cell.brickSlot * kBrickVoxels + voxelLinearIndex(v)] = d;
+}

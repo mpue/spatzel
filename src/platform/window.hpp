@@ -41,6 +41,9 @@ enum class Key : uint8_t {
     Q,
     E,
     LeftShift,
+    Num1, // renderer: reference
+    Num2, // renderer: brick
+    Num3, // brick debug view: cycle
     Count,
 };
 

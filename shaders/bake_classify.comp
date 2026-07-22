@@ -1,0 +1,85 @@
+#version 450 core
+
+// Bake pass 1 of 2 — classification and allocation.
+//
+// One thread per top-level cell. It evaluates the shared scene SDF at the cell
+// centre and decides whether the cell can hold a surface. If it can, it claims
+// a brick slot from the pool with an atomic bump allocator; if it cannot, it
+// writes an empty marker carrying the conservative centre distance. The fill
+// pass reads these decisions.
+//
+// This is a full, static bake over a fixed pool. The "allocation" is a bump
+// pointer within a single bake — not the GPU-driven dynamic allocation the
+// non-goals exclude.
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+#ifdef TARGET_VULKAN
+layout(push_constant) uniform Bake {
+    vec4  aabbMin;
+    vec4  aabbMax;
+    ivec4 control; // x = primitiveCount, y = pool capacity in slots
+} u;
+#else
+layout(binding = 0, std140) uniform Bake {
+    vec4  aabbMin;
+    vec4  aabbMax;
+    ivec4 control;
+} u;
+#endif
+
+#include "sdf_scene.glsl"   // scene edit list at slot 1
+#include "brick_common.glsl"
+
+#ifdef TARGET_VULKAN
+layout(set = 0, binding = 2, std430) buffer Cells { Cell cells[]; };
+layout(set = 0, binding = 4, std430) buffer Stats { uint stats[]; };
+#else
+layout(binding = 2, std430) buffer Cells { Cell cells[]; };
+layout(binding = 4, std430) buffer Stats { uint stats[]; };
+#endif
+
+void main() {
+    const ivec3 c = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(c, ivec3(kGridRes)))) {
+        return;
+    }
+    const int idx = cellLinearIndex(c);
+
+    const vec3 step    = cellSizeOf(u.aabbMin.xyz, u.aabbMax.xyz);
+    const vec3 cellMin = u.aabbMin.xyz + vec3(c) * step;
+    const vec3 center  = cellMin + 0.5 * step;
+
+    const int primCount = u.control.x;
+    const int capacity  = u.control.y;
+
+    const float d = sceneSdf(center, primCount).distance;
+
+    // A brick samples half a voxel beyond the cell on every side. A surface
+    // farther from the centre than the distance to that farthest sampled corner
+    // cannot reach any voxel, because the scene field is Lipschitz-1 (min and
+    // polynomial smin both are). So this test never drops a cell that holds a
+    // surface — it is conservative by construction, no tuned margin needed.
+    const vec3  voxelStep     = step / float(kBrickInterior);
+    const float surfaceRadius = length(0.5 * step + 0.5 * voxelStep);
+
+    Cell cell;
+    if (abs(d) <= surfaceRadius) {
+        const uint slot = atomicAdd(stats[0], 1u);
+        if (slot < uint(capacity)) {
+            cell.brickSlot     = int(slot);
+            cell.emptyDistance = 0.0;
+        } else {
+            // Pool exhausted. Count it and fall back to a (wrong but defined)
+            // empty marker; the non-zero overflow count is a hard failure the
+            // host reports at startup. The fixed scene is sized not to hit this.
+            atomicAdd(stats[1], 1u);
+            cell.brickSlot     = -1;
+            cell.emptyDistance = d;
+        }
+    } else {
+        cell.brickSlot     = -1;
+        cell.emptyDistance = d;
+    }
+    cells[idx] = cell;
+}

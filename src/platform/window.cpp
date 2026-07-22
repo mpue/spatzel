@@ -29,6 +29,9 @@ int toGlfwKey(Key key) {
         case Key::Q:         return GLFW_KEY_Q;
         case Key::E:         return GLFW_KEY_E;
         case Key::LeftShift: return GLFW_KEY_LEFT_SHIFT;
+        case Key::Num1:      return GLFW_KEY_1;
+        case Key::Num2:      return GLFW_KEY_2;
+        case Key::Num3:      return GLFW_KEY_3;
         case Key::Count:     break;
     }
     return GLFW_KEY_UNKNOWN;
