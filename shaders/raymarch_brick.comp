@@ -206,7 +206,11 @@ void main() {
         if (u.debugMode == 2) {
             colour = vec3(0.2, 0.9, 0.3); // hit inside a brick
         } else {
-            colour = shadeHit(albedo, normal, rd, travelled);
+            // The point light is shaded, but this path casts no shadow: a shadow
+            // ray here would have to march the brick field, which the 'spiel'
+            // branch scopes out. Pass 1.0 (fully lit) — the reference renderer
+            // is the only one that occludes the point light for now.
+            colour = shadeHit(albedo, normal, position, rd, travelled, 1.0);
         }
     } else {
         colour = background(rd);
