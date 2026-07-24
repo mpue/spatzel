@@ -102,16 +102,31 @@ function(fitzel_add_shaders TARGET)
     add_custom_target(${TARGET} DEPENDS ${_outputs})
     set_property(TARGET ${TARGET} PROPERTY FITZEL_SHADER_DIR "${_output_dir}")
     set_property(TARGET ${TARGET} PROPERTY FITZEL_SHADER_SUBDIR "${ARG_SUBDIR}")
+    set_property(TARGET ${TARGET} PROPERTY FITZEL_SHADER_OUTPUTS "${_outputs}")
 endfunction()
 
 # Copies a variant's .spv files into <exe dir>/shaders/<subdir>/.
+#
+# The staging is driven by a stamp that DEPENDS on the compiled .spv files, not
+# hung on the executable's POST_BUILD: a shader-only edit recompiles the .spv
+# but does not relink the exe, so a POST_BUILD copy would never run and the exe
+# would silently keep loading the previously staged shader. Depending on the
+# outputs makes the copy re-run exactly when a variant is recompiled; the exe
+# depends on the stamp so a normal build still stages before it runs.
 function(fitzel_stage_shaders EXE SHADER_TARGET)
-    get_property(_dir TARGET ${SHADER_TARGET} PROPERTY FITZEL_SHADER_DIR)
-    get_property(_subdir TARGET ${SHADER_TARGET} PROPERTY FITZEL_SHADER_SUBDIR)
-    add_dependencies(${EXE} ${SHADER_TARGET})
-    add_custom_command(TARGET ${EXE} POST_BUILD
+    get_property(_dir     TARGET ${SHADER_TARGET} PROPERTY FITZEL_SHADER_DIR)
+    get_property(_subdir  TARGET ${SHADER_TARGET} PROPERTY FITZEL_SHADER_SUBDIR)
+    get_property(_outputs TARGET ${SHADER_TARGET} PROPERTY FITZEL_SHADER_OUTPUTS)
+
+    set(_stamp "${CMAKE_CURRENT_BINARY_DIR}/${SHADER_TARGET}.staged")
+    add_custom_command(
+        OUTPUT "${_stamp}"
         COMMAND "${CMAKE_COMMAND}" -E copy_directory
                 "${_dir}" "$<TARGET_FILE_DIR:${EXE}>/shaders/${_subdir}"
+        COMMAND "${CMAKE_COMMAND}" -E touch "${_stamp}"
+        DEPENDS ${_outputs} ${SHADER_TARGET}
         COMMENT "Staging ${_subdir} SPIR-V next to ${EXE}"
         VERBATIM)
+    add_custom_target(${SHADER_TARGET}_stage ALL DEPENDS "${_stamp}")
+    add_dependencies(${EXE} ${SHADER_TARGET}_stage)
 endfunction()
