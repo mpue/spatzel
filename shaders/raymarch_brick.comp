@@ -92,6 +92,82 @@ vec3 brickNormal(int slot, vec3 p, vec3 cellMin, vec3 voxelStep) {
             sampleBrick(slot, p - vec3(0.0, 0.0, e.z), cellMin, voxelStep)));
 }
 
+// Soft shadow for the point light, marched through the brick field — the same
+// DDA the primary trace uses, run toward the light instead of along the eye
+// ray. This keeps the brick renderer's promise: the occlusion is read from the
+// baked structure, never from the edit list, so the shadow is self-consistent
+// with the brick geometry the rest of this shader shades.
+//
+// The penumbra estimator (IQ) tracks the smallest ratio of clearance to
+// distance travelled. In an occupied cell the clearance is the trilinear brick
+// distance; in an empty cell it is the Lipschitz bound the bake left at the
+// cell centre — a conservative lower bound on the true distance, which only
+// ever darkens the penumbra slightly and only where a surface is already near.
+//
+// The march stops at the light (a point light is not occluded from behind) and
+// at the grid AABB (a brick describes nothing outside it). The origin is pushed
+// off the surface along the normal so the fuzzy trilinear zero at the hit does
+// not shadow the hit against itself.
+float brickShadow(vec3 origin, vec3 lightPos, vec3 aabbMin, vec3 aabbMax, vec3 cell) {
+    const vec3  toLight   = lightPos - origin;
+    const float lightDist = length(toLight);
+    const vec3  dir       = toLight / lightDist;
+
+    // Same axis-parallel nudge the primary march uses: keep 0 * inf off the
+    // cell-boundary slab arithmetic.
+    const vec3 dirSafe = mix(dir, vec3(1e-6), lessThan(abs(dir), vec3(1e-6)));
+    const vec3 invD    = 1.0 / dirSafe;
+
+    const vec3  tA       = (aabbMin - origin) * invD;
+    const vec3  tB       = (aabbMax - origin) * invD;
+    const vec3  thi      = max(tA, tB);
+    const float tExitBox = min(min(thi.x, thi.y), thi.z);
+    const float tMax     = min(lightDist, tExitBox);
+
+    const float kSharpness = 12.0; // matches the reference renderer's penumbra
+    const float kEps       = 0.001;
+
+    float shadow = 1.0;
+    float t      = 0.04;           // step off the surface (trilinear zero is fuzzy)
+
+    for (int i = 0; i < 128; ++i) {
+        if (t > tMax) {
+            break;                 // reached the light or left the grid, unoccluded
+        }
+        const vec3 p = origin + dir * t;
+        ivec3 ci = clamp(ivec3(floor((p - aabbMin) / cell)), ivec3(0), ivec3(kGridRes - 1));
+
+        const vec3 cellMin = aabbMin + vec3(ci) * cell;
+        const vec3 cellMax = cellMin + cell;
+        const vec3  ec        = max((cellMin - origin) * invD, (cellMax - origin) * invD);
+        const float tCellExit = min(min(ec.x, ec.y), ec.z);
+
+        const Cell entry = cells[cellLinearIndex(ci)];
+        if (entry.brickSlot < 0) {
+            // Provably surface-free, so it occludes nothing and contributes no
+            // penumbra: the cell-centre bound is a distance to the nearest
+            // surface in *any* direction, not clearance along this ray, and
+            // feeding it to the estimator only bands the shadow at cell
+            // boundaries. Cross the cell (leaping further when the Lipschitz
+            // bound allows) and leave `shadow` untouched.
+            const vec3  center = cellMin + 0.5 * cell;
+            const float safe   = abs(entry.emptyDistance) - length(p - center);
+            t += max(tCellExit - t + kEps, safe);
+        } else {
+            const vec3  voxelStep = cell / float(kBrickInterior);
+            const float d         = sampleBrick(entry.brickSlot, p, cellMin, voxelStep);
+            if (d < kEps) {
+                return 0.0;        // fully occluded
+            }
+            shadow = min(shadow, kSharpness * d / t);
+            // Never step past the cell: a brick only describes its own cell.
+            t = min(t + max(d, 0.25 * min(voxelStep.x, min(voxelStep.y, voxelStep.z))),
+                    tCellExit + kEps);
+        }
+    }
+    return clamp(shadow, 0.0, 1.0);
+}
+
 vec3 stepHeat(float t) {
     // blue (few) -> green -> red (many), a cheap three-stop ramp.
     t = clamp(t, 0.0, 1.0);
@@ -206,11 +282,12 @@ void main() {
         if (u.debugMode == 2) {
             colour = vec3(0.2, 0.9, 0.3); // hit inside a brick
         } else {
-            // The point light is shaded, but this path casts no shadow: a shadow
-            // ray here would have to march the brick field, which the 'spiel'
-            // branch scopes out. Pass 1.0 (fully lit) — the reference renderer
-            // is the only one that occludes the point light for now.
-            colour = shadeHit(albedo, normal, position, rd, travelled, 1.0);
+            // Occlude the point light by marching the brick field toward it.
+            // Start off the surface along the normal so the trilinear zero at
+            // the hit does not shadow the hit against itself.
+            const float shadow = brickShadow(position + normal * 0.03,
+                                             kPointLightPosition, aabbMin, aabbMax, cell);
+            colour = shadeHit(albedo, normal, position, rd, travelled, shadow);
         }
     } else {
         colour = background(rd);
