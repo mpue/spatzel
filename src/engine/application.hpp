@@ -149,7 +149,12 @@ private:
     // buffer is allocated at kMaxPrimitives capacity so the editor can add
     // primitives without reallocating it; only the active prefix is uploaded
     // and only primitiveCount of it is evaluated.
-    static constexpr uint32_t     kMaxPrimitives = 256;
+    // Raised from 256 for the L-system vegetation generator: a tree easily runs
+    // to hundreds of segments. The reference renderer slows linearly (it
+    // evaluates every primitive per march step), but the brick renderer bakes
+    // once; the editor's generator shows a live count and blocks a generate that
+    // would overflow this budget.
+    static constexpr uint32_t     kMaxPrimitives = 2048;
     std::vector<GpuPrimitive>     m_scene;
     rhi::BufferHandle             m_sceneBuffer = rhi::BufferHandle::Invalid;
 

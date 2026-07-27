@@ -47,4 +47,22 @@ struct Quat {
     return {n.x * s, n.y * s, n.z * s, std::cos(radians * 0.5f)};
 }
 
+// Hamilton product: the rotation `b` followed by `a` (a * b). Enough to compose
+// turtle turns; still no slerp or matrices here, on purpose (see the file note).
+[[nodiscard]] inline Quat quatMul(Quat a, Quat b) {
+    return {
+        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
+    };
+}
+
+// Rotate a vector by a unit quaternion: v + 2w(q×v) + 2(q×(q×v)).
+[[nodiscard]] inline Vec3 quatRotate(Quat q, Vec3 v) {
+    const Vec3 u{q.x, q.y, q.z};
+    const Vec3 t = cross(u, v) * 2.0f;
+    return v + t * q.w + cross(u, t);
+}
+
 } // namespace engine

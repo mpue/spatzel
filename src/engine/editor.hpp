@@ -9,6 +9,7 @@
 // The panel issues only backend-neutral ImGui:: calls; the render backend that
 // puts those on screen lives behind the RHI seam.
 
+#include "engine/lsystem.hpp"
 #include "engine/render_mode.hpp"
 #include "engine/scene.hpp"
 
@@ -62,6 +63,37 @@ private:
     int         m_addType = 0;               // PrimitiveType for the Add control
     char        m_fileName[128] = "scene.json"; // save/load target (relative to sceneDir)
     std::string m_status;                    // last save/load result, shown in the panel
+
+    // --- Vegetation (L-system) generator ---------------------------------
+    // The panel edits text/number fields; a LSystemConfig is assembled from
+    // them on demand for the live estimate and for Generate. Rules are held as
+    // fixed char buffers so ImGui::InputText can write them directly.
+    static constexpr int kLsysMaxRules = 6;
+    struct LSystemUi {
+        char  axiom[128] = "X";
+        char  rulePred[kLsysMaxRules][2] = {"X", "F", "", "", "", ""};
+        char  ruleSucc[kLsysMaxRules][192] = {"F+[[X]-X]-F[-FX]+X", "FF", "", "", "", ""};
+        int   iterations    = 3;
+        float angleDeg      = 25.0f;
+        float segmentLength = 0.28f;
+        float lengthTaper   = 0.90f;
+        float baseRadius    = 0.06f;
+        float radiusTaper   = 0.74f;
+        float leafSize      = 0.09f;
+        bool  leaves        = true;
+        float tropism       = 0.04f;
+        int   seed          = 1;
+        float jitter        = 0.22f;
+        float basePos[3]    = {0.0f, 0.0f, 0.0f};
+        float branchColour[3] = {0.42f, 0.28f, 0.15f};
+        float leafColour[3]   = {0.28f, 0.55f, 0.20f};
+        int   preset          = 1; // index into the preset table; 0 = Custom
+    };
+    LSystemUi m_lsys;
+
+    void        buildLSystemPanel(std::vector<GpuPrimitive>& scene, const EditorStats& stats,
+                                  EditorActions& actions);
+    LSystemConfig lsysConfig() const; // assemble a config from the UI fields
 };
 
 } // namespace engine

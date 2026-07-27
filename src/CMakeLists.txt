@@ -78,6 +78,7 @@ add_library(fitzel_engine STATIC
     engine/camera.cpp
     engine/scene.cpp
     engine/scene_io.cpp
+    engine/lsystem.cpp
     engine/editor.cpp)
 target_link_libraries(fitzel_engine
     PUBLIC  fitzel_rhi fitzel_platform

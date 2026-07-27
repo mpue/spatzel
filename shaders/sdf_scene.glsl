@@ -27,10 +27,11 @@ struct Primitive {
     ivec4 control;  // x = type, y = operator
 };
 
-const int kTypeSphere = 0;
-const int kTypeBox    = 1;
-const int kTypeTorus  = 2;
-const int kTypePlane  = 3;
+const int kTypeSphere    = 0;
+const int kTypeBox       = 1;
+const int kTypeTorus     = 2;
+const int kTypePlane     = 3;
+const int kTypeRoundCone = 4;
 
 const int kOpUnion       = 0;
 const int kOpSmoothUnion = 1;
@@ -75,6 +76,22 @@ float sdPlane(vec3 p, vec3 normal, float offset) {
     return dot(p, normal) + offset;
 }
 
+// Tapered capsule (IQ's round cone), base at the local origin and tip at
+// (0, h, 0): radius r0 at the base, r1 at the tip. An exact distance function
+// and 1-Lipschitz, so it is safe for both sphere tracing and the brick
+// occupancy test. This is the branch/trunk primitive the L-system emits.
+float sdRoundCone(vec3 p, float r0, float r1, float h) {
+    const vec2 q = vec2(length(p.xz), p.y);
+
+    const float b = (r0 - r1) / h;
+    const float a = sqrt(max(1.0 - b * b, 0.0));
+    const float k = dot(q, vec2(-b, a));
+
+    if (k < 0.0)     return length(q) - r0;
+    if (k > a * h)   return length(q - vec2(0.0, h)) - r1;
+    return dot(q, vec2(a, b)) - r0;
+}
+
 float evaluatePrimitive(vec3 worldPoint, Primitive prim) {
     // A plane is defined in world space; everything else is defined in its own
     // frame and reached by undoing the transform. There is no scale term,
@@ -94,6 +111,10 @@ float evaluatePrimitive(vec3 worldPoint, Primitive prim) {
     }
     if (prim.control.x == kTypeTorus) {
         return sdTorus(local, prim.params.x, prim.params.y);
+    }
+    if (prim.control.x == kTypeRoundCone) {
+        // params: x = height, y = base radius, z = tip radius.
+        return sdRoundCone(local, prim.params.y, prim.params.z, prim.params.x);
     }
     return 1e9;
 }

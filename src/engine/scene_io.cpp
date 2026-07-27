@@ -17,7 +17,8 @@ using nlohmann::json;
 // form is that a person can read and hand-edit it. The mapping is the file
 // format's contract, so it is spelled out here rather than derived from the
 // enum's numeric value.
-constexpr std::array<std::string_view, 4> kTypeNames{"Sphere", "Box", "Torus", "Plane"};
+constexpr std::array<std::string_view, 5> kTypeNames{"Sphere", "Box", "Torus", "Plane",
+                                                     "RoundCone"};
 constexpr std::array<std::string_view, 4> kOperatorNames{"Union", "SmoothUnion", "Subtract",
                                                          "Intersect"};
 
