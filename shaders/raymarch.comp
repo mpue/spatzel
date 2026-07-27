@@ -19,18 +19,20 @@ layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 #ifdef TARGET_VULKAN
 layout(set = 0, binding = 0, rgba16f) uniform writeonly image2D uOutput;
 layout(push_constant) uniform Uniforms {
-    vec4  cameraPosition; // xyz, w = tan(fovY / 2)
-    vec4  cameraRight;    // xyz, w = aspect
-    vec4  cameraUp;       // xyz, w = time
-    vec4  cameraForward;  // xyz
+    vec4  cameraPosition;    // xyz, w = tan(fovY / 2)
+    vec4  cameraRight;       // xyz, w = aspect
+    vec4  cameraUp;          // xyz, w = time
+    vec4  cameraForward;     // xyz
     vec2  resolution;
     int   primitiveCount;
+    float exposure;
+    int   reflectionSamples; // glossy reflection rays per hit (>=1)
     float padding;
 } u;
 #else
 // OpenGL has no push constants. The backend maps the same byte blob onto a
 // uniform block; std140 and the push constant layout agree here because every
-// member is a vec4 or sits in the tightly packed 16-byte tail.
+// member is a vec4 or sits in the tightly packed scalar tail.
 layout(binding = 0, rgba16f) uniform writeonly image2D uOutput;
 layout(binding = 0, std140) uniform Uniforms {
     vec4  cameraPosition;
@@ -39,13 +41,15 @@ layout(binding = 0, std140) uniform Uniforms {
     vec4  cameraForward;
     vec2  resolution;
     int   primitiveCount;
+    float exposure;
+    int   reflectionSamples;
     float padding;
 } u;
 #endif
 
 // The edit list (slot 1), the distance functions and the fold over the list.
 #include "sdf_scene.glsl"
-// The directional + hemispherical-ambient + point-light shading model.
+// The metallic-roughness PBR shading model, Fresnel/GGX helpers and tonemap.
 #include "shading.glsl"
 
 // Soft shadow for the point light, IQ's penumbra estimator: march the scene
@@ -78,6 +82,62 @@ float pointLightShadow(vec3 hit, vec3 normal, int primitiveCount) {
         }
     }
     return clamp(shadow, 0.0, 1.0);
+}
+
+// March one reflection ray for a single bounce: on a hit, shade it (direct +
+// ambient + emission, with a shadow ray) but do NOT reflect again; on a miss,
+// return the sky. This is what a mirror sees looking along `dir`.
+vec3 reflectionSample(vec3 origin, vec3 dir, int primitiveCount) {
+    float travelled = 0.0;
+    for (int step = 0; step < 128; ++step) {
+        const vec3  p = origin + dir * travelled;
+        const Hit   h = sceneSdf(p, primitiveCount);
+        const float epsilon = 0.0006 * max(travelled, 1.0);
+        if (h.distance < epsilon) {
+            const vec3  n  = sceneNormal(p, primitiveCount);
+            const float sh = pointLightShadow(p + n * 0.02, n, primitiveCount);
+            vec3 lit = shadeHit(h.albedo, n, p, dir, h.material, sh);
+            // One bounce only: this hit gets no reflection ray of its own, so
+            // approximate its environment specular with the sky. Without it a
+            // reflected metal (no diffuse) reads as black wherever it is not
+            // catching a light.
+            const vec3  f0b   = materialF0(h.albedo, clamp(h.material.y, 0.0, 1.0));
+            const float ndotv = max(dot(n, -dir), 0.0);
+            lit += background(reflect(dir, n)) * fresnelSchlick(ndotv, f0b);
+            return lit;
+        }
+        travelled += h.distance;
+        if (travelled > 60.0) {
+            break;
+        }
+    }
+    return background(dir);
+}
+
+// Environment/scene specular: the reflected radiance, averaged over
+// roughness-jittered rays. Smooth surfaces collapse to a single sharp ray.
+vec3 reflectionColour(vec3 position, vec3 normal, vec3 rayDirection, vec4 material,
+                      int primitiveCount, ivec2 texel) {
+    const vec3  r      = reflect(rayDirection, normal);
+    const float rough  = clamp(material.x, 0.04, 1.0);
+    const vec3  origin = position + normal * 0.02;
+    const int   n      = clamp(u.reflectionSamples, 1, 32);
+
+    if (rough < 0.06 || n <= 1) {
+        return reflectionSample(origin, normalize(r), primitiveCount);
+    }
+
+    vec3 sum = vec3(0.0);
+    for (int i = 0; i < n; ++i) {
+        const vec2 xi = vec2(hash12(vec2(texel) + vec2(i, 0.0)),
+                             hash12(vec2(texel) + vec2(0.0, i + 1)));
+        vec3 dir = jitterDirection(r, rough, xi);
+        if (dot(dir, normal) < 0.0) {
+            dir = reflect(dir, normal); // keep the sample above the surface
+        }
+        sum += reflectionSample(origin, dir, primitiveCount);
+    }
+    return sum / float(n);
 }
 
 void main() {
@@ -134,10 +194,24 @@ void main() {
         // penumbra estimator does not read the hit's own zero distance.
         const float shadow = pointLightShadow(position + normal * 0.02, normal,
                                               u.primitiveCount);
-        colour = shadeHit(hit.albedo, normal, position, rayDirection, travelled, shadow);
+        vec3 lit = shadeHit(hit.albedo, normal, position, rayDirection, hit.material, shadow);
+
+        // Environment/scene specular, added on top via Fresnel: grazing angles
+        // and metals reflect more. Roughness blurs the reflection (in the ray).
+        const vec3  f0    = materialF0(hit.albedo, clamp(hit.material.y, 0.0, 1.0));
+        const float ndotv = max(dot(normal, -rayDirection), 0.0);
+        const vec3  fres  = fresnelSchlick(ndotv, f0);
+        const vec3  refl  = reflectionColour(position, normal, rayDirection, hit.material,
+                                             u.primitiveCount, texel);
+        lit += refl * fres;
+
+        colour = fadeToBackground(lit, rayDirection, travelled);
     } else {
         colour = background(rayDirection);
     }
 
+    // Exposure + ACES + sRGB: the presented image is UNORM and unconverted, so
+    // the whole output transform happens here.
+    colour = tonemap(colour, u.exposure);
     imageStore(uOutput, texel, vec4(colour, 1.0));
 }

@@ -17,7 +17,8 @@ using nlohmann::json;
 // form is that a person can read and hand-edit it. The mapping is the file
 // format's contract, so it is spelled out here rather than derived from the
 // enum's numeric value.
-constexpr std::array<std::string_view, 4> kTypeNames{"Sphere", "Box", "Torus", "Plane"};
+constexpr std::array<std::string_view, 5> kTypeNames{"Sphere", "Box", "Torus", "Plane",
+                                                     "RoundCone"};
 constexpr std::array<std::string_view, 4> kOperatorNames{"Union", "SmoothUnion", "Subtract",
                                                          "Intersect"};
 
@@ -82,9 +83,12 @@ void saveScene(const std::filesystem::path& path, const std::vector<GpuPrimitive
             {"blend", p.position[3]},
             {"params", {p.params[0], p.params[1], p.params[2], p.params[3]}},
             {"albedo", {p.albedo[0], p.albedo[1], p.albedo[2]}},
+            {"roughness", p.material[0]},
+            {"metallic", p.material[1]},
+            {"emissive", p.material[2]},
         });
     }
-    const json document{{"version", 1}, {"primitives", std::move(primitives)}};
+    const json document{{"version", 2}, {"primitives", std::move(primitives)}};
 
     std::ofstream file(path, std::ios::trunc);
     if (!file) {
@@ -138,6 +142,11 @@ std::vector<GpuPrimitive> loadScene(const std::filesystem::path& path) {
         p.albedo[0]   = albedo[0];
         p.albedo[1]   = albedo[1];
         p.albedo[2]   = albedo[2];
+        // Material fields arrived in schema version 2; scenes that predate them
+        // (examples, generated plants) keep the struct's matte defaults.
+        p.material[0] = node.value("roughness", p.material[0]);
+        p.material[1] = node.value("metallic", p.material[1]);
+        p.material[2] = node.value("emissive", p.material[2]);
         p.control[0]  = typeFromName(node.at("type").get<std::string>());
         p.control[1]  = operatorFromName(node.at("operator").get<std::string>());
         scene.push_back(p);

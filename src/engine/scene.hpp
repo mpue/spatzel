@@ -15,10 +15,11 @@
 namespace engine {
 
 enum class PrimitiveType : int32_t {
-    Sphere = 0,
-    Box    = 1,
-    Torus  = 2,
-    Plane  = 3,
+    Sphere    = 0,
+    Box       = 1,
+    Torus     = 2,
+    Plane     = 3,
+    RoundCone = 4, // tapered capsule: the natural branch/trunk primitive
 };
 
 enum class Operator : int32_t {
@@ -37,14 +38,19 @@ struct alignas(16) GpuPrimitive {
     float   params[4]   = {};                       // per type, see below
     float   albedo[4]   = {0.8f, 0.8f, 0.8f, 0.0f};
     int32_t control[4]  = {};                       // x = PrimitiveType, y = Operator
+    float   material[4] = {0.6f, 0.0f, 0.0f, 0.0f}; // x = roughness, y = metallic,
+                                                    // z = emissive, w = reserved
 };
-static_assert(sizeof(GpuPrimitive) == 80, "GpuPrimitive must match its GLSL counterpart");
+static_assert(sizeof(GpuPrimitive) == 96, "GpuPrimitive must match its GLSL counterpart");
 
 // Parameter conventions, shared with raymarch.comp:
-//   Sphere  params.x   = radius
-//   Box     params.xyz = half extents, params.w = corner rounding
-//   Torus   params.x   = major radius, params.y = minor radius
-//   Plane   params.xyz = unit normal,  params.w = offset along it
+//   Sphere    params.x   = radius
+//   Box       params.xyz = half extents, params.w = corner rounding
+//   Torus     params.x   = major radius, params.y = minor radius
+//   Plane     params.xyz = unit normal,  params.w = offset along it
+//   RoundCone params.x   = height h, params.y = base radius, params.z = tip radius.
+//             The base sits at `position`; the tip at position + rotation·(0, h, 0).
+//             A proper 1-Lipschitz distance function, like every primitive here.
 //
 // There is no scale: a non-uniform scale destroys the distance metric that
 // sphere tracing depends on. Translation and rotation are what an SDF

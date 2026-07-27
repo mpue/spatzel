@@ -97,9 +97,11 @@ private:
         float   cameraForward[4]  = {}; // xyz
         float   resolution[2]     = {};
         int32_t primitiveCount    = 0;
+        float   exposure          = 1.0f;
+        int32_t reflectionSamples = 4;   // glossy reflection rays per hit
         float   padding           = 0.0f;
     };
-    static_assert(sizeof(SceneUniforms) == 80, "push constant block must stay under 128 bytes");
+    static_assert(sizeof(SceneUniforms) == 88, "push constant block must stay under 128 bytes");
 
     // Mirrors the push constant block in raymarch_brick.comp: the camera block
     // above plus the debug view selector and the grid AABB.
@@ -113,8 +115,10 @@ private:
         int32_t debugMode         = 0;
         float   aabbMin[4]        = {};
         float   aabbMax[4]        = {};
+        float   exposure          = 1.0f;
+        int32_t reflectionSamples = 4;
     };
-    static_assert(sizeof(BrickUniforms) == 112, "brick push constants must stay under 128 bytes");
+    static_assert(sizeof(BrickUniforms) == 120, "brick push constants must stay under 128 bytes");
 
     // Mirrors the push constant block in the bake shaders.
     struct BakeUniforms {
@@ -149,7 +153,12 @@ private:
     // buffer is allocated at kMaxPrimitives capacity so the editor can add
     // primitives without reallocating it; only the active prefix is uploaded
     // and only primitiveCount of it is evaluated.
-    static constexpr uint32_t     kMaxPrimitives = 256;
+    // Raised from 256 for the L-system vegetation generator: a tree easily runs
+    // to hundreds of segments. The reference renderer slows linearly (it
+    // evaluates every primitive per march step), but the brick renderer bakes
+    // once; the editor's generator shows a live count and blocks a generate that
+    // would overflow this budget.
+    static constexpr uint32_t     kMaxPrimitives = 2048;
     std::vector<GpuPrimitive>     m_scene;
     rhi::BufferHandle             m_sceneBuffer = rhi::BufferHandle::Invalid;
 
@@ -165,9 +174,10 @@ private:
     bool              m_haveBake     = false; // a re-bake has been timed at least once
     double            m_bakeStart    = 0.0;   // wall clock at the timed re-bake's submit
 
-    RendererMode m_renderer     = RendererMode::Brick;
-    int32_t      m_debugView    = 0;
-    bool         m_debugKeyHeld = false;
+    RendererMode   m_renderer     = RendererMode::Brick;
+    int32_t        m_debugView    = 0;
+    bool           m_debugKeyHeld = false;
+    RenderSettings m_render;       // exposure + reflection samples, edited in the panel
 
     // Editor UI.
     Editor                m_editor;

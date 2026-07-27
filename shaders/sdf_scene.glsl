@@ -25,12 +25,14 @@ struct Primitive {
     vec4  params;   // per type
     vec4  albedo;   // rgb
     ivec4 control;  // x = type, y = operator
+    vec4  material; // x = roughness, y = metallic, z = emissive, w = reserved
 };
 
-const int kTypeSphere = 0;
-const int kTypeBox    = 1;
-const int kTypeTorus  = 2;
-const int kTypePlane  = 3;
+const int kTypeSphere    = 0;
+const int kTypeBox       = 1;
+const int kTypeTorus     = 2;
+const int kTypePlane     = 3;
+const int kTypeRoundCone = 4;
 
 const int kOpUnion       = 0;
 const int kOpSmoothUnion = 1;
@@ -75,6 +77,22 @@ float sdPlane(vec3 p, vec3 normal, float offset) {
     return dot(p, normal) + offset;
 }
 
+// Tapered capsule (IQ's round cone), base at the local origin and tip at
+// (0, h, 0): radius r0 at the base, r1 at the tip. An exact distance function
+// and 1-Lipschitz, so it is safe for both sphere tracing and the brick
+// occupancy test. This is the branch/trunk primitive the L-system emits.
+float sdRoundCone(vec3 p, float r0, float r1, float h) {
+    const vec2 q = vec2(length(p.xz), p.y);
+
+    const float b = (r0 - r1) / h;
+    const float a = sqrt(max(1.0 - b * b, 0.0));
+    const float k = dot(q, vec2(-b, a));
+
+    if (k < 0.0)     return length(q) - r0;
+    if (k > a * h)   return length(q - vec2(0.0, h)) - r1;
+    return dot(q, vec2(a, b)) - r0;
+}
+
 float evaluatePrimitive(vec3 worldPoint, Primitive prim) {
     // A plane is defined in world space; everything else is defined in its own
     // frame and reached by undoing the transform. There is no scale term,
@@ -94,6 +112,10 @@ float evaluatePrimitive(vec3 worldPoint, Primitive prim) {
     }
     if (prim.control.x == kTypeTorus) {
         return sdTorus(local, prim.params.x, prim.params.y);
+    }
+    if (prim.control.x == kTypeRoundCone) {
+        // params: x = height, y = base radius, z = tip radius.
+        return sdRoundCone(local, prim.params.y, prim.params.z, prim.params.x);
     }
     return 1e9;
 }
@@ -116,6 +138,7 @@ vec2 smoothUnion(float a, float b, float k) {
 struct Hit {
     float distance;
     vec3  albedo;
+    vec4  material; // x = roughness, y = metallic, z = emissive, w = reserved
 };
 
 // Folds the edit list into a single field, left to right: each primitive
@@ -133,6 +156,7 @@ Hit sceneSdf(vec3 p, int primitiveCount) {
     Hit result;
     result.distance = 1e9;
     result.albedo   = vec3(0.8);
+    result.material = vec4(0.6, 0.0, 0.0, 0.0); // matte default, matches the CPU side
 
     for (int i = 0; i < primitiveCount; ++i) {
         const Primitive prim = scene.primitives[i];
@@ -141,7 +165,10 @@ Hit sceneSdf(vec3 p, int primitiveCount) {
 
         if (op == kOpSmoothUnion) {
             const vec2 blended = smoothUnion(result.distance, d, prim.position.w);
+            // Material follows the same blend factor as albedo, so a melted seam
+            // transitions its roughness/metallic as legibly as its colour.
             result.albedo   = mix(result.albedo, prim.albedo.rgb, blended.y);
+            result.material = mix(result.material, prim.material, blended.y);
             result.distance = blended.x;
         } else if (op == kOpSubtract) {
             // Carve this primitive out of the accumulated shape. The newly
@@ -152,12 +179,14 @@ Hit sceneSdf(vec3 p, int primitiveCount) {
             // Keep only what is also inside this primitive. The binding surface
             // is the farther of the two, so that one's material shows.
             if (d > result.distance) {
-                result.albedo = prim.albedo.rgb;
+                result.albedo   = prim.albedo.rgb;
+                result.material = prim.material;
             }
             result.distance = max(result.distance, d);
         } else { // kOpUnion
             if (d < result.distance) {
-                result.albedo = prim.albedo.rgb;
+                result.albedo   = prim.albedo.rgb;
+                result.material = prim.material;
             }
             result.distance = min(result.distance, d);
         }

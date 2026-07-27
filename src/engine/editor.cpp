@@ -15,14 +15,16 @@
 namespace engine {
 namespace {
 
-constexpr std::array<const char*, 4> kTypeNames{"Sphere", "Box", "Torus", "Plane"};
+constexpr std::array<const char*, 5> kTypeNames{"Sphere", "Box", "Torus", "Plane", "Round Cone"};
 constexpr std::array<const char*, 4> kOperatorNames{"Union", "SmoothUnion", "Subtract",
                                                     "Intersect"};
 
 constexpr size_t kMaxUndo = 128;
 
 const char* typeLabel(int32_t type) {
-    return (type >= 0 && type < 4) ? kTypeNames[static_cast<size_t>(type)] : "?";
+    return (type >= 0 && type < static_cast<int32_t>(kTypeNames.size()))
+               ? kTypeNames[static_cast<size_t>(type)]
+               : "?";
 }
 
 GpuPrimitive makeDefault(PrimitiveType type) {
@@ -48,6 +50,11 @@ GpuPrimitive makeDefault(PrimitiveType type) {
         case PrimitiveType::Plane:
             p.position[1] = 0.0f;
             p.params[1]   = 1.0f; // unit normal pointing up
+            break;
+        case PrimitiveType::RoundCone:
+            p.params[0] = 1.0f;  // height
+            p.params[1] = 0.15f; // base radius
+            p.params[2] = 0.08f; // tip radius
             break;
     }
     return p;
@@ -84,7 +91,7 @@ void Editor::clampSelection(const std::vector<GpuPrimitive>& scene) {
 }
 
 EditorActions Editor::draw(std::vector<GpuPrimitive>& scene, RendererMode& renderer,
-                           bool brickAvailable, const EditorStats& stats,
+                           RenderSettings& render, bool brickAvailable, const EditorStats& stats,
                            const std::filesystem::path& sceneDir) {
     EditorActions actions;
     clampSelection(scene);
@@ -134,6 +141,15 @@ EditorActions Editor::draw(std::vector<GpuPrimitive>& scene, RendererMode& rende
         }
     }
     ImGui::Text("Primitives: %d / %d", stats.primitiveCount, stats.maxPrimitives);
+
+    ImGui::Separator();
+
+    // --- render settings ---------------------------------------------------
+    // Exposure and reflection-sample count feed the marcher uniforms directly;
+    // no re-upload or re-bake, so they need no track()/action flag.
+    ImGui::SliderFloat("Exposure", &render.exposure, 0.1f, 8.0f, "%.2f",
+                       ImGuiSliderFlags_Logarithmic);
+    ImGui::SliderInt("Reflection samples", &render.reflectionSamples, 1, 32);
 
     ImGui::Separator();
 
@@ -214,6 +230,7 @@ EditorActions Editor::draw(std::vector<GpuPrimitive>& scene, RendererMode& rende
             std::copy(std::begin(p.position), std::end(p.position), std::begin(fresh.position));
             std::copy(std::begin(p.rotation), std::end(p.rotation), std::begin(fresh.rotation));
             std::copy(std::begin(p.albedo), std::end(p.albedo), std::begin(fresh.albedo));
+            std::copy(std::begin(p.material), std::end(p.material), std::begin(fresh.material));
             fresh.control[1] = p.control[1];
             p                = fresh;
             actions.sceneChanged = actions.bakeMeasure = true;
@@ -264,13 +281,34 @@ EditorActions Editor::draw(std::vector<GpuPrimitive>& scene, RendererMode& rende
                 ImGui::DragFloat("Offset", &p.params[3], 0.01f);
                 track();
                 break;
+            case PrimitiveType::RoundCone:
+                ImGui::DragFloat("Height", &p.params[0], 0.01f, 0.0f, 100.0f);
+                track();
+                ImGui::DragFloat("Base radius", &p.params[1], 0.005f, 0.0f, 100.0f);
+                track();
+                ImGui::DragFloat("Tip radius", &p.params[2], 0.005f, 0.0f, 100.0f);
+                track();
+                break;
         }
 
         ImGui::ColorEdit3("Albedo", p.albedo);
         track();
+
+        // Metallic-roughness PBR material.
+        ImGui::SliderFloat("Roughness", &p.material[0], 0.0f, 1.0f);
+        track();
+        ImGui::SliderFloat("Metallic", &p.material[1], 0.0f, 1.0f);
+        track();
+        ImGui::DragFloat("Emissive", &p.material[2], 0.02f, 0.0f, 20.0f);
+        track();
     } else {
         ImGui::TextDisabled("No primitive selected");
     }
+
+    ImGui::Separator();
+
+    // --- vegetation generator ---------------------------------------------
+    buildLSystemPanel(scene, stats, actions);
 
     ImGui::Separator();
 
@@ -343,6 +381,157 @@ EditorActions Editor::draw(std::vector<GpuPrimitive>& scene, RendererMode& rende
 
     ImGui::End();
     return actions;
+}
+
+LSystemConfig Editor::lsysConfig() const {
+    LSystemConfig c;
+    c.axiom = m_lsys.axiom;
+    for (int i = 0; i < kLsysMaxRules; ++i) {
+        if (m_lsys.rulePred[i][0] != '\0' && m_lsys.ruleSucc[i][0] != '\0') {
+            c.rules.push_back(LRule{m_lsys.rulePred[i][0], m_lsys.ruleSucc[i]});
+        }
+    }
+    c.iterations    = m_lsys.iterations;
+    c.angleDeg      = m_lsys.angleDeg;
+    c.segmentLength = m_lsys.segmentLength;
+    c.lengthTaper   = m_lsys.lengthTaper;
+    c.baseRadius    = m_lsys.baseRadius;
+    c.radiusTaper   = m_lsys.radiusTaper;
+    c.leafSize      = m_lsys.leafSize;
+    c.leaves        = m_lsys.leaves;
+    c.tropism       = m_lsys.tropism;
+    c.seed          = static_cast<std::uint32_t>(m_lsys.seed);
+    c.jitter        = m_lsys.jitter;
+    c.basePosition  = {m_lsys.basePos[0], m_lsys.basePos[1], m_lsys.basePos[2]};
+    c.branchColour  = {m_lsys.branchColour[0], m_lsys.branchColour[1], m_lsys.branchColour[2]};
+    c.leafColour    = {m_lsys.leafColour[0], m_lsys.leafColour[1], m_lsys.leafColour[2]};
+    return c;
+}
+
+void Editor::buildLSystemPanel(std::vector<GpuPrimitive>& scene, const EditorStats& stats,
+                               EditorActions& actions) {
+    if (!ImGui::CollapsingHeader("Vegetation (L-System)")) {
+        return;
+    }
+
+    const auto clearRules = [&]() {
+        for (int i = 0; i < kLsysMaxRules; ++i) {
+            m_lsys.rulePred[i][0] = '\0';
+            m_lsys.ruleSucc[i][0] = '\0';
+        }
+    };
+    const auto setRule = [&](int i, const char* pred, const char* succ) {
+        std::snprintf(m_lsys.rulePred[i], sizeof(m_lsys.rulePred[i]), "%s", pred);
+        std::snprintf(m_lsys.ruleSucc[i], sizeof(m_lsys.ruleSucc[i]), "%s", succ);
+    };
+
+    // Presets seed the whole config; "Custom" leaves the fields as they are so a
+    // user can dial in their own grammar without a preset overwriting it.
+    static constexpr std::array<const char*, 4> kPresetNames{"Custom", "Plant", "Bush", "Tree (3D)"};
+    if (ImGui::Combo("Preset", &m_lsys.preset, kPresetNames.data(),
+                     static_cast<int>(kPresetNames.size()))) {
+        switch (m_lsys.preset) {
+            case 1: // Plant — the classic planar fractal plant, softened by jitter
+                std::snprintf(m_lsys.axiom, sizeof(m_lsys.axiom), "%s", "X");
+                clearRules();
+                setRule(0, "X", "F+[[X]-X]-F[-FX]+X");
+                setRule(1, "F", "FF");
+                m_lsys.iterations = 3;   m_lsys.angleDeg = 25.0f;
+                m_lsys.segmentLength = 0.28f; m_lsys.lengthTaper = 0.90f;
+                m_lsys.baseRadius = 0.06f; m_lsys.radiusTaper = 0.74f;
+                m_lsys.leafSize = 0.09f; m_lsys.leaves = true;
+                m_lsys.tropism = 0.04f;  m_lsys.jitter = 0.22f;
+                break;
+            case 2: // Bush — a rounder, denser plant. Grows ~8x per pass, so it
+                    // stays at 3 iterations to fit the primitive budget.
+                std::snprintf(m_lsys.axiom, sizeof(m_lsys.axiom), "%s", "F");
+                clearRules();
+                setRule(0, "F", "FF-[-F+F+F]+[+F-F-F]");
+                m_lsys.iterations = 3;   m_lsys.angleDeg = 22.0f;
+                m_lsys.segmentLength = 0.22f; m_lsys.lengthTaper = 0.88f;
+                m_lsys.baseRadius = 0.06f; m_lsys.radiusTaper = 0.78f;
+                m_lsys.leafSize = 0.11f; m_lsys.leaves = true;
+                m_lsys.tropism = 0.03f;  m_lsys.jitter = 0.30f;
+                break;
+            case 3: // Tree (3D) — pitched sub-branches rolled apart into 3D.
+                    // Leaves are placed automatically at the twig tips.
+                std::snprintf(m_lsys.axiom, sizeof(m_lsys.axiom), "%s", "A");
+                clearRules();
+                setRule(0, "A", "F[&FA]/////[&FA]///////[&FA]");
+                setRule(1, "F", "FF");
+                m_lsys.iterations = 4;   m_lsys.angleDeg = 26.0f;
+                m_lsys.segmentLength = 0.26f; m_lsys.lengthTaper = 0.90f;
+                m_lsys.baseRadius = 0.16f; m_lsys.radiusTaper = 0.72f;
+                m_lsys.leafSize = 0.16f; m_lsys.leaves = true;
+                m_lsys.tropism = 0.05f;  m_lsys.jitter = 0.24f;
+                break;
+            default:
+                break; // Custom
+        }
+    }
+
+    ImGui::InputText("Axiom", m_lsys.axiom, sizeof(m_lsys.axiom));
+    ImGui::TextDisabled("Rules (predecessor -> successor)");
+    for (int i = 0; i < kLsysMaxRules; ++i) {
+        ImGui::PushID(i);
+        ImGui::SetNextItemWidth(24.0f);
+        if (ImGui::InputText("##pred", m_lsys.rulePred[i], sizeof(m_lsys.rulePred[i]))) {
+            m_lsys.preset = 0;
+        }
+        ImGui::SameLine();
+        ImGui::TextUnformatted("->");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::InputText("##succ", m_lsys.ruleSucc[i], sizeof(m_lsys.ruleSucc[i]))) {
+            m_lsys.preset = 0;
+        }
+        ImGui::PopID();
+    }
+
+    ImGui::SliderInt("Iterations", &m_lsys.iterations, 0, 8);
+    ImGui::SliderFloat("Angle", &m_lsys.angleDeg, 0.0f, 90.0f, "%.1f deg");
+    ImGui::DragFloat("Segment len", &m_lsys.segmentLength, 0.005f, 0.01f, 5.0f);
+    ImGui::SliderFloat("Length taper", &m_lsys.lengthTaper, 0.40f, 1.0f);
+    ImGui::DragFloat("Base radius", &m_lsys.baseRadius, 0.002f, 0.005f, 2.0f);
+    ImGui::SliderFloat("Radius taper", &m_lsys.radiusTaper, 0.50f, 1.0f);
+    ImGui::SliderFloat("Tropism", &m_lsys.tropism, -0.30f, 0.30f);
+    ImGui::Checkbox("Leaves", &m_lsys.leaves);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(90.0f);
+    ImGui::DragFloat("Leaf size", &m_lsys.leafSize, 0.005f, 0.01f, 1.0f);
+    ImGui::DragInt("Seed", &m_lsys.seed, 0.1f, 0, 100000);
+    ImGui::SliderFloat("Jitter", &m_lsys.jitter, 0.0f, 1.0f);
+    ImGui::DragFloat3("Base pos", m_lsys.basePos, 0.02f);
+    ImGui::ColorEdit3("Branch col", m_lsys.branchColour);
+    ImGui::ColorEdit3("Leaf col", m_lsys.leafColour);
+
+    // Live estimate: expand the grammar (string-only, cheap) and count the draw
+    // symbols, so the primitive cost is visible before committing to Generate.
+    const LSystemConfig cfg      = lsysConfig();
+    const std::string   expanded = lsystemExpand(cfg);
+    const int           estimate = lsystemPrimitiveCount(expanded, cfg);
+    const int           freeSlots = stats.maxPrimitives - stats.primitiveCount;
+    const bool          overflow = estimate > freeSlots;
+
+    if (overflow) {
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f),
+                           "~ %d primitives (only %d free)", estimate, freeSlots);
+    } else {
+        ImGui::Text("~ %d primitives (%d free)", estimate, freeSlots);
+    }
+
+    // Same capacity guard the Add button uses — never let a bulk insert be
+    // silently truncated by uploadScene.
+    ImGui::BeginDisabled(overflow || estimate == 0);
+    if (ImGui::Button("Generate")) {
+        pushUndo(scene);
+        const std::vector<GpuPrimitive> plant = lsystemBuild(expanded, cfg);
+        scene.insert(scene.end(), plant.begin(), plant.end());
+        clampSelection(scene);
+        actions.sceneChanged = actions.bakeMeasure = true;
+        m_status = "Generated " + std::to_string(plant.size()) + " primitives";
+    }
+    ImGui::EndDisabled();
 }
 
 } // namespace engine
