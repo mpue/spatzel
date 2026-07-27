@@ -116,8 +116,9 @@ private:
         float   aabbMin[4]        = {};
         float   aabbMax[4]        = {};
         float   exposure          = 1.0f;
+        int32_t reflectionSamples = 4;
     };
-    static_assert(sizeof(BrickUniforms) == 116, "brick push constants must stay under 128 bytes");
+    static_assert(sizeof(BrickUniforms) == 120, "brick push constants must stay under 128 bytes");
 
     // Mirrors the push constant block in the bake shaders.
     struct BakeUniforms {

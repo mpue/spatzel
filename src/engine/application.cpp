@@ -490,6 +490,8 @@ void Application::recordBrick(rhi::CommandList& cmd) {
     uniforms.aabbMax[0]     = brick::kAabbMax.x;
     uniforms.aabbMax[1]     = brick::kAabbMax.y;
     uniforms.aabbMax[2]     = brick::kAabbMax.z;
+    uniforms.exposure          = cam.exposure;
+    uniforms.reflectionSamples = cam.reflectionSamples;
 
     cmd.bindComputePipeline(m_brickPipeline);
     cmd.bindStorageTexture(0, m_renderTarget);

@@ -64,6 +64,26 @@ vec3 materialF0(vec3 albedo, float metallic) {
     return mix(vec3(0.04), albedo, metallic);
 }
 
+// --- glossy reflection sampling (shared by both marchers) -------------------
+
+float hash12(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+// Jitter the mirror direction `r` inside a cone whose width grows with
+// roughness, so a rough surface blurs its reflection. Sampled in the tangent
+// plane of `r`.
+vec3 jitterDirection(vec3 r, float roughness, vec2 xi) {
+    const vec3  up = abs(r.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    const vec3  t  = normalize(cross(up, r));
+    const vec3  b  = cross(r, t);
+    const float ang = 6.2831853 * xi.x;
+    const float rad = roughness * roughness * xi.y; // roughness^2 spread
+    return normalize(r + (cos(ang) * t + sin(ang) * b) * rad);
+}
+
 // One analytic light's Cook-Torrance contribution.
 vec3 pbrDirect(vec3 n, vec3 v, vec3 l, vec3 radiance, vec3 albedo, vec3 f0,
                float roughness, float metallic) {
