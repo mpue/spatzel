@@ -91,7 +91,7 @@ void Editor::clampSelection(const std::vector<GpuPrimitive>& scene) {
 }
 
 EditorActions Editor::draw(std::vector<GpuPrimitive>& scene, RendererMode& renderer,
-                           bool brickAvailable, const EditorStats& stats,
+                           RenderSettings& render, bool brickAvailable, const EditorStats& stats,
                            const std::filesystem::path& sceneDir) {
     EditorActions actions;
     clampSelection(scene);
@@ -141,6 +141,15 @@ EditorActions Editor::draw(std::vector<GpuPrimitive>& scene, RendererMode& rende
         }
     }
     ImGui::Text("Primitives: %d / %d", stats.primitiveCount, stats.maxPrimitives);
+
+    ImGui::Separator();
+
+    // --- render settings ---------------------------------------------------
+    // Exposure and reflection-sample count feed the marcher uniforms directly;
+    // no re-upload or re-bake, so they need no track()/action flag.
+    ImGui::SliderFloat("Exposure", &render.exposure, 0.1f, 8.0f, "%.2f",
+                       ImGuiSliderFlags_Logarithmic);
+    ImGui::SliderInt("Reflection samples", &render.reflectionSamples, 1, 32);
 
     ImGui::Separator();
 

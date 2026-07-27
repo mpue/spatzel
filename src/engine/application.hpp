@@ -174,9 +174,10 @@ private:
     bool              m_haveBake     = false; // a re-bake has been timed at least once
     double            m_bakeStart    = 0.0;   // wall clock at the timed re-bake's submit
 
-    RendererMode m_renderer     = RendererMode::Brick;
-    int32_t      m_debugView    = 0;
-    bool         m_debugKeyHeld = false;
+    RendererMode   m_renderer     = RendererMode::Brick;
+    int32_t        m_debugView    = 0;
+    bool           m_debugKeyHeld = false;
+    RenderSettings m_render;       // exposure + reflection samples, edited in the panel
 
     // Editor UI.
     Editor                m_editor;

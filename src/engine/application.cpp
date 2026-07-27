@@ -366,7 +366,7 @@ void Application::buildUi() {
     stats.haveBake       = m_haveBake;
 
     const EditorActions actions =
-        m_editor.draw(m_scene, m_renderer, /*brickAvailable=*/true, stats, m_sceneDir);
+        m_editor.draw(m_scene, m_renderer, m_render, /*brickAvailable=*/true, stats, m_sceneDir);
 
     if (actions.sceneChanged || actions.bakeMeasure) {
         // The edit list is the single source of truth; push it to the GPU and
@@ -460,6 +460,8 @@ Application::SceneUniforms Application::cameraUniforms() const {
         .resolution     = {static_cast<float>(m_targetExtent.width),
                            static_cast<float>(m_targetExtent.height)},
         .primitiveCount = static_cast<int32_t>(m_scene.size()),
+        .exposure          = m_render.exposure,
+        .reflectionSamples = m_render.reflectionSamples,
     };
 }
 

@@ -36,6 +36,13 @@ struct EditorActions {
     bool bakeMeasure  = false; // the change was committed -> time the resulting re-bake
 };
 
+// Global render settings the panel edits in place. These feed the marcher
+// uniforms directly and need no re-upload or re-bake — the next frame reads them.
+struct RenderSettings {
+    float exposure          = 1.0f;
+    int   reflectionSamples = 4; // glossy reflection rays per hit
+};
+
 class Editor {
 public:
     // Builds the panel for this frame. Mutates `scene` and `renderer` in place:
@@ -43,7 +50,7 @@ public:
     // directly. `sceneDir` is where scene files are saved and where example
     // scenes are listed from.
     EditorActions draw(std::vector<GpuPrimitive>& scene, RendererMode& renderer,
-                       bool brickAvailable, const EditorStats& stats,
+                       RenderSettings& render, bool brickAvailable, const EditorStats& stats,
                        const std::filesystem::path& sceneDir);
 
 private:
