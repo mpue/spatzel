@@ -38,8 +38,10 @@ struct alignas(16) GpuPrimitive {
     float   params[4]   = {};                       // per type, see below
     float   albedo[4]   = {0.8f, 0.8f, 0.8f, 0.0f};
     int32_t control[4]  = {};                       // x = PrimitiveType, y = Operator
+    float   material[4] = {0.6f, 0.0f, 0.0f, 0.0f}; // x = roughness, y = metallic,
+                                                    // z = emissive, w = reserved
 };
-static_assert(sizeof(GpuPrimitive) == 80, "GpuPrimitive must match its GLSL counterpart");
+static_assert(sizeof(GpuPrimitive) == 96, "GpuPrimitive must match its GLSL counterpart");
 
 // Parameter conventions, shared with raymarch.comp:
 //   Sphere    params.x   = radius

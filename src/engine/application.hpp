@@ -97,9 +97,11 @@ private:
         float   cameraForward[4]  = {}; // xyz
         float   resolution[2]     = {};
         int32_t primitiveCount    = 0;
+        float   exposure          = 1.0f;
+        int32_t reflectionSamples = 4;   // glossy reflection rays per hit
         float   padding           = 0.0f;
     };
-    static_assert(sizeof(SceneUniforms) == 80, "push constant block must stay under 128 bytes");
+    static_assert(sizeof(SceneUniforms) == 88, "push constant block must stay under 128 bytes");
 
     // Mirrors the push constant block in raymarch_brick.comp: the camera block
     // above plus the debug view selector and the grid AABB.
@@ -113,8 +115,9 @@ private:
         int32_t debugMode         = 0;
         float   aabbMin[4]        = {};
         float   aabbMax[4]        = {};
+        float   exposure          = 1.0f;
     };
-    static_assert(sizeof(BrickUniforms) == 112, "brick push constants must stay under 128 bytes");
+    static_assert(sizeof(BrickUniforms) == 116, "brick push constants must stay under 128 bytes");
 
     // Mirrors the push constant block in the bake shaders.
     struct BakeUniforms {

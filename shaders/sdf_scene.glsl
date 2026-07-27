@@ -25,6 +25,7 @@ struct Primitive {
     vec4  params;   // per type
     vec4  albedo;   // rgb
     ivec4 control;  // x = type, y = operator
+    vec4  material; // x = roughness, y = metallic, z = emissive, w = reserved
 };
 
 const int kTypeSphere    = 0;
@@ -137,6 +138,7 @@ vec2 smoothUnion(float a, float b, float k) {
 struct Hit {
     float distance;
     vec3  albedo;
+    vec4  material; // x = roughness, y = metallic, z = emissive, w = reserved
 };
 
 // Folds the edit list into a single field, left to right: each primitive
@@ -154,6 +156,7 @@ Hit sceneSdf(vec3 p, int primitiveCount) {
     Hit result;
     result.distance = 1e9;
     result.albedo   = vec3(0.8);
+    result.material = vec4(0.6, 0.0, 0.0, 0.0); // matte default, matches the CPU side
 
     for (int i = 0; i < primitiveCount; ++i) {
         const Primitive prim = scene.primitives[i];
@@ -162,7 +165,10 @@ Hit sceneSdf(vec3 p, int primitiveCount) {
 
         if (op == kOpSmoothUnion) {
             const vec2 blended = smoothUnion(result.distance, d, prim.position.w);
+            // Material follows the same blend factor as albedo, so a melted seam
+            // transitions its roughness/metallic as legibly as its colour.
             result.albedo   = mix(result.albedo, prim.albedo.rgb, blended.y);
+            result.material = mix(result.material, prim.material, blended.y);
             result.distance = blended.x;
         } else if (op == kOpSubtract) {
             // Carve this primitive out of the accumulated shape. The newly
@@ -173,12 +179,14 @@ Hit sceneSdf(vec3 p, int primitiveCount) {
             // Keep only what is also inside this primitive. The binding surface
             // is the farther of the two, so that one's material shows.
             if (d > result.distance) {
-                result.albedo = prim.albedo.rgb;
+                result.albedo   = prim.albedo.rgb;
+                result.material = prim.material;
             }
             result.distance = max(result.distance, d);
         } else { // kOpUnion
             if (d < result.distance) {
-                result.albedo = prim.albedo.rgb;
+                result.albedo   = prim.albedo.rgb;
+                result.material = prim.material;
             }
             result.distance = min(result.distance, d);
         }

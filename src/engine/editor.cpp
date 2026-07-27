@@ -221,6 +221,7 @@ EditorActions Editor::draw(std::vector<GpuPrimitive>& scene, RendererMode& rende
             std::copy(std::begin(p.position), std::end(p.position), std::begin(fresh.position));
             std::copy(std::begin(p.rotation), std::end(p.rotation), std::begin(fresh.rotation));
             std::copy(std::begin(p.albedo), std::end(p.albedo), std::begin(fresh.albedo));
+            std::copy(std::begin(p.material), std::end(p.material), std::begin(fresh.material));
             fresh.control[1] = p.control[1];
             p                = fresh;
             actions.sceneChanged = actions.bakeMeasure = true;
@@ -282,6 +283,14 @@ EditorActions Editor::draw(std::vector<GpuPrimitive>& scene, RendererMode& rende
         }
 
         ImGui::ColorEdit3("Albedo", p.albedo);
+        track();
+
+        // Metallic-roughness PBR material.
+        ImGui::SliderFloat("Roughness", &p.material[0], 0.0f, 1.0f);
+        track();
+        ImGui::SliderFloat("Metallic", &p.material[1], 0.0f, 1.0f);
+        track();
+        ImGui::DragFloat("Emissive", &p.material[2], 0.02f, 0.0f, 20.0f);
         track();
     } else {
         ImGui::TextDisabled("No primitive selected");

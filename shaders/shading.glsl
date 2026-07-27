@@ -2,18 +2,19 @@
 #define FITZEL_SHADING_GLSL
 
 // The shading model, shared so the reference and brick renderers cannot drift
-// apart in how they light a hit. A directional key light plus a hemispherical
-// ambient term, and — added on the 'spiel' branch — a shadow-casting point
-// light layered on top.
+// apart in how they light a hit. A metallic-roughness PBR model (Cook-Torrance
+// GGX) lit by a directional key light and a shadow-casting point light, over a
+// hemispherical ambient stand-in for diffuse IBL.
 //
-// The point light's *shading* (position, attenuation, its diffuse term) lives
-// here so both renderers light it identically. Its *shadow*, however, is a
-// scene-marching query, and marching is the one thing the two renderers do
-// differently — so the occlusion factor is computed by each renderer's own
-// marcher and passed in as `pointShadow`. Only the reference renderer casts a
-// real shadow ray; the brick renderer passes 1.0 and shows the point light
-// unshadowed. Keeping the query out of shadeHit is what lets the shading model
-// stay a single shared function.
+// shadeHit returns the *linear HDR* lit colour and nothing else — no background
+// fade, no tonemap. That is deliberate: the reference marcher composites a
+// glossy reflection on top before the scene is faded into the background and the
+// whole thing is tonemapped, so those two steps are the tail of each marcher's
+// main(), not part of shadeHit. Keeping the point light's occlusion out of here
+// (passed in as `pointShadow`) is what lets the two renderers share this while
+// each marches its own shadow ray.
+
+const float kPi = 3.14159265359;
 
 const vec3 kLightDirection = normalize(vec3(0.45, 0.8, 0.35));
 const vec3 kLightColour    = vec3(1.0, 0.97, 0.90);
@@ -32,28 +33,105 @@ vec3 background(vec3 rayDirection) {
     return mix(vec3(0.13, 0.14, 0.17), vec3(0.42, 0.52, 0.68), clamp(t, 0.0, 1.0));
 }
 
-// Shade a surface hit and fade it into the background near the march limit, so
-// the unbounded ground plane does not end in a hard line. `position` is the
-// world-space hit; `pointShadow` is the occlusion of the point light along the
-// ray to it (1 = lit, 0 = shadowed), computed by the caller's own marcher.
+// --- Cook-Torrance terms ----------------------------------------------------
+
+float distributionGGX(vec3 n, vec3 h, float roughness) {
+    const float a  = roughness * roughness;
+    const float a2 = a * a;
+    const float nh = max(dot(n, h), 0.0);
+    const float d  = nh * nh * (a2 - 1.0) + 1.0;
+    return a2 / max(kPi * d * d, 1e-7);
+}
+
+float geometrySchlickGGX(float nv, float roughness) {
+    // Direct-lighting remap of roughness to k.
+    const float r = roughness + 1.0;
+    const float k = (r * r) / 8.0;
+    return nv / (nv * (1.0 - k) + k);
+}
+
+float geometrySmith(vec3 n, vec3 v, vec3 l, float roughness) {
+    return geometrySchlickGGX(max(dot(n, v), 0.0), roughness) *
+           geometrySchlickGGX(max(dot(n, l), 0.0), roughness);
+}
+
+vec3 fresnelSchlick(float cosTheta, vec3 f0) {
+    return f0 + (vec3(1.0) - f0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+// Dielectrics reflect a flat 4%; metals tint the reflection with their albedo.
+vec3 materialF0(vec3 albedo, float metallic) {
+    return mix(vec3(0.04), albedo, metallic);
+}
+
+// One analytic light's Cook-Torrance contribution.
+vec3 pbrDirect(vec3 n, vec3 v, vec3 l, vec3 radiance, vec3 albedo, vec3 f0,
+               float roughness, float metallic) {
+    const float nl = max(dot(n, l), 0.0);
+    if (nl <= 0.0) {
+        return vec3(0.0);
+    }
+    const vec3  h = normalize(v + l);
+    const float d = distributionGGX(n, h, roughness);
+    const float g = geometrySmith(n, v, l, roughness);
+    const vec3  f = fresnelSchlick(max(dot(h, v), 0.0), f0);
+
+    const vec3 specular = (d * g * f) / max(4.0 * max(dot(n, v), 0.0) * nl, 1e-4);
+    // Energy left for diffuse after reflection, and metals have no diffuse.
+    const vec3 kd = (vec3(1.0) - f) * (1.0 - metallic);
+    return (kd * albedo / kPi + specular) * radiance * nl;
+}
+
+// Direct + ambient-diffuse + emission, in linear HDR. `rayDirection` is the
+// incident (eye→hit) direction; `material` is (roughness, metallic, emissive, _).
+// The environment/scene specular (the reflection) is added by the caller.
 vec3 shadeHit(vec3 albedo, vec3 normal, vec3 position, vec3 rayDirection,
-              float travelled, float pointShadow) {
-    const float diffuse = max(dot(normal, kLightDirection), 0.0);
-    // Hemispherical ambient: sky above, bounce below. Cheap, and it keeps unlit
-    // faces from going flat black without any AO term.
-    const vec3 ambient = mix(kAmbientGround, kAmbientSky, 0.5 + 0.5 * normal.y);
+              vec4 material, float pointShadow) {
+    const float roughness = clamp(material.x, 0.04, 1.0);
+    const float metallic  = clamp(material.y, 0.0, 1.0);
+    const float emissive  = material.z;
 
-    // Point light: Lambert term with inverse-square falloff, gated by the
-    // shadow factor the caller marched. The distance is measured to the hit, so
-    // the same light shapes near and far surfaces consistently.
-    const vec3  toLight     = kPointLightPosition - position;
-    const float distSq      = max(dot(toLight, toLight), 1e-4);
-    const vec3  lightDir    = toLight * inversesqrt(distSq);
-    const float pointDiffuse = max(dot(normal, lightDir), 0.0);
-    const vec3  point = kPointLightColour * (kPointLightIntensity / distSq) *
-                        pointDiffuse * pointShadow;
+    const vec3 v  = -rayDirection;
+    const vec3 f0 = materialF0(albedo, metallic);
 
-    vec3 colour = albedo * (ambient + kLightColour * diffuse + point);
+    // Directional key light.
+    vec3 lit = pbrDirect(normal, v, kLightDirection, kLightColour, albedo, f0,
+                         roughness, metallic);
+
+    // Point light: inverse-square falloff, gated by the marched shadow factor.
+    const vec3  toLight = kPointLightPosition - position;
+    const float distSq  = max(dot(toLight, toLight), 1e-4);
+    const vec3  lDir     = toLight * inversesqrt(distSq);
+    const vec3  radiance = kPointLightColour * (kPointLightIntensity / distSq) * pointShadow;
+    lit += pbrDirect(normal, v, lDir, radiance, albedo, f0, roughness, metallic);
+
+    // Hemispherical ambient as a cheap diffuse-IBL term; metals take no diffuse.
+    const vec3 ambient = mix(kAmbientGround, kAmbientSky, 0.5 + 0.5 * normal.y) *
+                         albedo * (1.0 - metallic);
+    lit += ambient;
+
+    // Emission scales the albedo, so a glowing material keeps its own colour.
+    lit += albedo * emissive;
+    return lit;
+}
+
+// --- output transform -------------------------------------------------------
+
+// ACES filmic approximation (Narkowicz), then the sRGB OETF. The presented image
+// is UNORM and unconverted (see ARCHITECTURE leak #7), so the encode has to
+// happen here for the window to show a correct, tone-mapped result.
+vec3 tonemap(vec3 hdr, float exposure) {
+    vec3 x = hdr * exposure;
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+    x = clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+    return mix(1.055 * pow(x, vec3(1.0 / 2.4)) - 0.055, x * 12.92,
+               vec3(lessThan(x, vec3(0.0031308))));
+}
+
+// Fade a shaded surface into the background near the march limit, so the
+// unbounded ground plane does not end in a hard line. Applied after reflection
+// compositing, before tonemapping.
+vec3 fadeToBackground(vec3 colour, vec3 rayDirection, float travelled) {
     return mix(colour, background(rayDirection), clamp((travelled - 25.0) / 45.0, 0.0, 1.0));
 }
 

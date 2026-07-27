@@ -26,6 +26,7 @@ layout(push_constant) uniform Uniforms {
     int   debugMode;      // 0 = shaded, 1 = step heat, 2 = brick/empty tint
     vec4  aabbMin;        // xyz
     vec4  aabbMax;        // xyz
+    float exposure;
 } u;
 #else
 layout(binding = 0, rgba16f) uniform writeonly image2D uOutput;
@@ -39,6 +40,7 @@ layout(binding = 0, std140) uniform Uniforms {
     int   debugMode;
     vec4  aabbMin;
     vec4  aabbMax;
+    float exposure;
 } u;
 #endif
 
@@ -270,28 +272,42 @@ void main() {
         imageStore(uOutput, texel, vec4(stepHeat(float(steps) / float(kMaxSteps)), 1.0));
         return;
     }
+    if (u.debugMode == 2) {
+        // Raw brick/empty tint — bypasses the output transform on purpose.
+        const vec3 tint = found ? vec3(0.2, 0.9, 0.3) : background(rd);
+        imageStore(uOutput, texel, vec4(tint, 1.0));
+        return;
+    }
 
     vec3 colour;
     if (found) {
         const vec3 position = ro + rd * travelled;
         const vec3 normal   = brickNormal(hitSlot, position, hitCellMin, hitVoxel);
-        // Bricks store distance only; the albedo comes from a single edit-list
-        // evaluation at the hit. Material is a non-goal, so this stays cheap.
-        const vec3 albedo = sceneSdf(position, u.primitiveCount).albedo;
+        // Bricks store distance only; albedo AND material come from a single
+        // edit-list evaluation at the hit (the brick path picks up PBR material
+        // for free through the shared sceneSdf fold). Reflections are marched in
+        // the reference renderer only for now.
+        const Hit surf = sceneSdf(position, u.primitiveCount);
 
-        if (u.debugMode == 2) {
-            colour = vec3(0.2, 0.9, 0.3); // hit inside a brick
-        } else {
-            // Occlude the point light by marching the brick field toward it.
-            // Start off the surface along the normal so the trilinear zero at
-            // the hit does not shadow the hit against itself.
-            const float shadow = brickShadow(position + normal * 0.03,
-                                             kPointLightPosition, aabbMin, aabbMax, cell);
-            colour = shadeHit(albedo, normal, position, rd, travelled, shadow);
-        }
+        // Occlude the point light by marching the brick field toward it. Start
+        // off the surface along the normal so the trilinear zero at the hit does
+        // not shadow the hit against itself.
+        const float shadow = brickShadow(position + normal * 0.03,
+                                         kPointLightPosition, aabbMin, aabbMax, cell);
+        vec3 lit = shadeHit(surf.albedo, normal, position, rd, surf.material, shadow);
+
+        // No reflection ray in the brick path yet (Milestone 2): approximate the
+        // environment specular with the sky so metals show a reflection instead
+        // of going black. Same cheap stand-in the reference uses on its bounce.
+        const vec3  f0    = materialF0(surf.albedo, clamp(surf.material.y, 0.0, 1.0));
+        const float ndotv = max(dot(normal, -rd), 0.0);
+        lit += background(reflect(rd, normal)) * fresnelSchlick(ndotv, f0);
+
+        colour = fadeToBackground(lit, rd, travelled);
     } else {
         colour = background(rd);
     }
 
+    colour = tonemap(colour, u.exposure);
     imageStore(uOutput, texel, vec4(colour, 1.0));
 }
