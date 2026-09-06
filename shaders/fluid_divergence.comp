@@ -1,0 +1,49 @@
+#version 450 core
+
+// Right-hand side of the pressure equation: the divergence of the advected
+// velocity field, per fluid cell.
+//
+// Only cells that are water AND not obstacle carry a pressure unknown, so only
+// those get a right-hand side; everything else is written as zero rather than
+// left alone, because the buffer is reused across steps and a stale value would
+// quietly become a source term.
+//
+// Closed faces (tank wall or obstacle) contribute zero flow whatever the buffer
+// holds. Reading the closed face as zero here rather than trusting it to have
+// been zeroed is what makes the boundary condition a property of the stencil
+// instead of a property of the history.
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+#define FLUID_PUSH
+#define FLUID_VEL_SRC
+#define FLUID_PHI_SRC
+#define FLUID_SOLID_R
+#define FLUID_DIVERGENCE_W
+#include "fluid_common.glsl"
+
+float faceVelocity(int axis, ivec3 f, int res) {
+    return fluidFaceClosed(axis, f, res) ? 0.0 : fluidVelAt(axis, f, res);
+}
+
+void main() {
+    const ivec3 id  = ivec3(gl_GlobalInvocationID);
+    const int   res = u.control.x;
+    if (any(greaterThanEqual(id, ivec3(res)))) {
+        return;
+    }
+
+    const int cell = fluidCellIndex(id, res);
+    if (!fluidIsWater(id, res)) {
+        gDivergenceOut[cell] = 0.0;
+        return;
+    }
+
+    const float h = u.domain.w;
+    const float flux =
+        (faceVelocity(0, id + ivec3(1, 0, 0), res) - faceVelocity(0, id, res)) +
+        (faceVelocity(1, id + ivec3(0, 1, 0), res) - faceVelocity(1, id, res)) +
+        (faceVelocity(2, id + ivec3(0, 0, 1), res) - faceVelocity(2, id, res));
+
+    gDivergenceOut[cell] = flux / h;
+}

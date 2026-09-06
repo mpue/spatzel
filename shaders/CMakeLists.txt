@@ -3,7 +3,18 @@ set(FITZEL_SHADER_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/raymarch_brick.comp"
     "${CMAKE_CURRENT_SOURCE_DIR}/bake_classify.comp"
     "${CMAKE_CURRENT_SOURCE_DIR}/bake_fill.comp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/pick.comp")
+    "${CMAKE_CURRENT_SOURCE_DIR}/pick.comp"
+    # The fluid solver: one dispatch each, run in the order listed by
+    # engine::FluidSim::recordStep.
+    "${CMAKE_CURRENT_SOURCE_DIR}/fluid_seed.comp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/fluid_solids.comp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/fluid_advect.comp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/fluid_divergence.comp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/fluid_pressure.comp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/fluid_project.comp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/fluid_extrapolate.comp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/fluid_reinit.comp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/fluid_stats.comp")
 
 # Shared #include files: the scene evaluation, the shading model and the brick
 # structure. They are not compiled on their own — they carry no entry point —
@@ -11,7 +22,9 @@ set(FITZEL_SHADER_SOURCES
 set(FITZEL_SHADER_INCLUDES
     "${CMAKE_CURRENT_SOURCE_DIR}/sdf_scene.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shading.glsl"
-    "${CMAKE_CURRENT_SOURCE_DIR}/brick_common.glsl")
+    "${CMAKE_CURRENT_SOURCE_DIR}/brick_common.glsl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/fluid_common.glsl"
+    "${CMAKE_CURRENT_SOURCE_DIR}/fluid_field.glsl")
 
 if(FITZEL_WITH_VULKAN)
     fitzel_add_shaders(fitzel_shaders_vulkan

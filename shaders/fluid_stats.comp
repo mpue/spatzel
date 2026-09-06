@@ -1,0 +1,68 @@
+#version 450 core
+
+// The diagnostics pass. Runs once per frame, after the last substep, and
+// measures the two things that say whether the solver is doing its job:
+//
+//   [0] water volume, in thousandths of a cell, summed with a smeared Heaviside
+//       so the figure moves smoothly instead of in whole-cell jumps. Semi-
+//       Lagrangian advection of a level set loses volume; this is the number
+//       that says how much, and it is reported rather than hidden because it is
+//       the honest limit of a pure grid liquid.
+//   [1] the largest remaining |divergence| after projection, in millionths.
+//       Jacobi stops where it is told to stop, so this is the residual the
+//       chosen iteration count actually achieved — the equivalent of the brick
+//       renderer's comparison against the reference: a claim with a number
+//       behind it instead of an assertion.
+//   [2] the largest |velocity| component, in thousandths. A run that is about
+//       to go unstable says so here first.
+//
+// Integer atomics because the RHI has no reduction primitive and adding one
+// would put a synchronisation model in the seam. Fixed-point scaling is the
+// price; the ranges are chosen so that a plausible simulation cannot wrap.
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+#define FLUID_PUSH
+#define FLUID_VEL_SRC
+#define FLUID_PHI_SRC
+#define FLUID_SOLID_R
+#define FLUID_STATS
+#include "fluid_common.glsl"
+
+float faceVelocity(int axis, ivec3 f, int res) {
+    return fluidFaceClosed(axis, f, res) ? 0.0 : fluidVelAt(axis, f, res);
+}
+
+void main() {
+    const ivec3 id  = ivec3(gl_GlobalInvocationID);
+    const int   res = u.control.x;
+    if (any(greaterThanEqual(id, ivec3(res)))) {
+        return;
+    }
+
+    const float h   = u.domain.w;
+    const float phi = fluidPhiAt(id, res);
+
+    if (!fluidSolidCell(id, res)) {
+        const float fraction = clamp(0.5 - phi / (2.0 * h), 0.0, 1.0);
+        if (fraction > 0.0) {
+            atomicAdd(gStats[0], uint(fraction * 1000.0 + 0.5));
+        }
+    }
+
+    if (!fluidIsWater(id, res)) {
+        return;
+    }
+
+    const float divergence =
+        ((faceVelocity(0, id + ivec3(1, 0, 0), res) - faceVelocity(0, id, res)) +
+         (faceVelocity(1, id + ivec3(0, 1, 0), res) - faceVelocity(1, id, res)) +
+         (faceVelocity(2, id + ivec3(0, 0, 1), res) - faceVelocity(2, id, res))) / h;
+
+    atomicMax(gStats[1], uint(min(abs(divergence) * 1.0e6, 4.0e9)));
+
+    const float speed = max(abs(faceVelocity(0, id, res)),
+                            max(abs(faceVelocity(1, id, res)),
+                                abs(faceVelocity(2, id, res))));
+    atomicMax(gStats[2], uint(min(speed * 1000.0, 4.0e9)));
+}

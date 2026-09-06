@@ -98,6 +98,8 @@ int main(int argc, char** argv) {
                 config.tolerance = std::strtof(argv[++i], nullptr);
             } else if (arg == "--max-outlier-fraction" && hasValue) {
                 config.maxOutlierFraction = std::strtof(argv[++i], nullptr);
+            } else if (arg == "--fluid") {
+                config.fluid = true;
             } else if (arg == "--no-ui") {
                 config.enableUi = false;
             } else if (arg == "--scene" && hasValue) {
@@ -115,10 +117,12 @@ int main(int argc, char** argv) {
         // exit, without opening a window. Used to seed the example scenes from
         // the canonical buildScene().
         if (!saveScenePath.empty()) {
+            engine::fluid::Settings fluidSettings{};
             const std::vector<engine::GpuPrimitive> scene =
-                config.scenePath.empty() ? engine::buildScene()
-                                         : engine::loadScene(config.scenePath);
-            engine::saveScene(saveScenePath, scene);
+                config.scenePath.empty()
+                    ? engine::buildScene()
+                    : engine::loadScene(config.scenePath, nullptr, &fluidSettings);
+            engine::saveScene(saveScenePath, scene, nullptr, &fluidSettings);
             std::fprintf(stderr, "[scene] wrote %s\n", saveScenePath.string().c_str());
             return 0;
         }

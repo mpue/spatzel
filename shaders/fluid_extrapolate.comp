@@ -1,0 +1,86 @@
+#version 450 core
+
+// Velocity extrapolation into the air. One sweep per dispatch; the engine runs
+// a handful of them, ping-ponging the velocity buffers.
+//
+// Why it is needed: advection backtraces from a face just above the surface and
+// lands in air. Without a velocity there the water reads zero from above and
+// the free surface behaves as if it were glued to still air — the surface goes
+// flat and the splash dies. So the fluid velocity is propagated outward a few
+// cells before the next advection reads it.
+//
+// The propagation is by level-set descent rather than by an explicit valid-flag
+// front: an air face takes the mean of its same-component neighbours that lie
+// strictly closer to the water. That is a sweep of the same shape as a fast
+// march without the bookkeeping, and it reaches exactly as far as the number of
+// sweeps the engine dispatches. Beyond the band the velocity is pinned to zero,
+// which bounds what gravity can accumulate in air nothing looks at.
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+#define FLUID_PUSH
+#define FLUID_VEL_SRC
+#define FLUID_VEL_DST
+#define FLUID_PHI_SRC
+#define FLUID_SOLID_R
+#include "fluid_common.glsl"
+
+void main() {
+    const ivec3 id  = ivec3(gl_GlobalInvocationID);
+    const int   res = u.control.x;
+    if (any(greaterThan(id, ivec3(res)))) {
+        return;
+    }
+
+    const float h    = u.domain.w;
+    const float band = kFluidVelocityBand * h;
+
+    for (int axis = 0; axis < 3; ++axis) {
+        const int index = fluidVelIndex(axis, id, res);
+        if (!fluidFaceLive(axis, id, res) || fluidFaceClosed(axis, id, res)) {
+            gVelDst[index] = 0.0;
+            continue;
+        }
+
+        // A face the projection solved for is left exactly alone. That includes
+        // every face on the free surface itself, where the averaged level set is
+        // positive but the velocity is nonetheless a solved one — overwriting
+        // those is how an extrapolation pass silently undoes the projection it
+        // was supposed to extend.
+        if (fluidFaceSolved(axis, id, res)) {
+            gVelDst[index] = fluidVelAt(axis, id, res);
+            continue;
+        }
+
+        const float phi = fluidPhiAtFace(axis, id, res);
+        if (phi > band) {
+            gVelDst[index] = 0.0; // beyond the band nothing reads this face
+            continue;
+        }
+
+        float sum   = 0.0;
+        int   count = 0;
+        for (int a = 0; a < 3; ++a) {
+            for (int side = -1; side <= 1; side += 2) {
+                ivec3 nb = id;
+                nb[a] += side;
+                if (any(lessThan(nb, ivec3(0))) || any(greaterThan(nb, ivec3(res)))) {
+                    continue;
+                }
+                if (!fluidFaceLive(axis, nb, res)) {
+                    continue;
+                }
+                // Take only from neighbours closer to the water than this face —
+                // solved faces always qualify, which is what seeds the sweep.
+                if (!fluidFaceSolved(axis, nb, res) &&
+                    fluidPhiAtFace(axis, nb, res) >= phi) {
+                    continue;
+                }
+                sum += fluidVelAt(axis, nb, res);
+                ++count;
+            }
+        }
+
+        gVelDst[index] = count > 0 ? sum / float(count) : fluidVelAt(axis, id, res);
+    }
+}

@@ -21,6 +21,21 @@ namespace rhi::vulkan {
 
 class VulkanDevice;
 
+// One frame's per-frame Vulkan objects. At namespace scope rather than nested in
+// VulkanDevice because the command list holds one: it draws descriptor sets from
+// the frame's pool list and may need to extend it mid-frame.
+struct FrameResources {
+    VkCommandPool    commandPool    = VK_NULL_HANDLE;
+    VkCommandBuffer  commandBuffer  = VK_NULL_HANDLE;
+    VkFence          inFlight       = VK_NULL_HANDLE;
+    VkSemaphore      imageAvailable = VK_NULL_HANDLE;
+
+    // Grown on demand and reset wholesale at the start of every frame. Index
+    // `poolCursor` is the one currently being allocated from.
+    std::vector<VkDescriptorPool> descriptorPools;
+    size_t                        poolCursor = 0;
+};
+
 // ---------------------------------------------------------------------------
 // Command list
 //
@@ -34,7 +49,11 @@ class VulkanCommandList final : public CommandList {
 public:
     explicit VulkanCommandList(VulkanDevice& device) : m_device(device) {}
 
-    void reset(VkCommandBuffer cmd, VkDescriptorPool descriptorPool);
+    // `frame` supplies the descriptor pools this list allocates from. A list
+    // that exhausts one takes the next, so a frame that records hundreds of
+    // dispatches (a fluid step is over a hundred on its own) is a matter of
+    // allocating another pool rather than a hard cap.
+    void reset(VkCommandBuffer cmd, FrameResources& frame);
 
     void bindComputePipeline(PipelineHandle pipeline) override;
     void pushConstants(std::span<const std::byte> data) override;
@@ -56,9 +75,14 @@ private:
     void setBinding(PendingBinding binding);
     void flushBindings();
 
+    // Allocates a descriptor set from the frame's current pool, moving to the
+    // next one (creating it if this frame has never needed that many) when the
+    // current pool is full.
+    [[nodiscard]] VkDescriptorSet allocateDescriptorSet(VkDescriptorSetLayout layout);
+
     VulkanDevice&               m_device;
     VkCommandBuffer             m_cmd            = VK_NULL_HANDLE;
-    VkDescriptorPool            m_descriptorPool = VK_NULL_HANDLE;
+    FrameResources*             m_frame          = nullptr;
     PipelineHandle              m_pipeline       = PipelineHandle::Invalid;
     std::vector<PendingBinding> m_bindings;
     bool                        m_bindingsDirty  = false;
@@ -99,13 +123,9 @@ public:
 private:
     friend class VulkanCommandList;
 
-    struct Frame {
-        VkCommandPool    commandPool    = VK_NULL_HANDLE;
-        VkCommandBuffer  commandBuffer  = VK_NULL_HANDLE;
-        VkFence          inFlight       = VK_NULL_HANDLE;
-        VkSemaphore      imageAvailable = VK_NULL_HANDLE;
-        VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
-    };
+    using Frame = FrameResources;
+
+    [[nodiscard]] VkDescriptorPool createDescriptorPool() const;
 
     void createInstance(const DeviceCreateInfo& info);
     void createSurface(void* nativeWindowHandle);

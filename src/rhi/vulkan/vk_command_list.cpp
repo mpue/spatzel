@@ -8,9 +8,9 @@
 
 namespace rhi::vulkan {
 
-void VulkanCommandList::reset(VkCommandBuffer cmd, VkDescriptorPool descriptorPool) {
+void VulkanCommandList::reset(VkCommandBuffer cmd, FrameResources& frame) {
     m_cmd            = cmd;
-    m_descriptorPool = descriptorPool;
+    m_frame          = &frame;
     m_pipeline       = PipelineHandle::Invalid;
     m_bindings.clear();
     m_bindingsDirty = false;
@@ -66,6 +66,40 @@ void VulkanCommandList::clearBuffer(BufferHandle handle) {
     vkCmdFillBuffer(m_cmd, buffer.buffer, 0, buffer.size, 0);
 }
 
+// Descriptor sets come out of the frame's pool list. A full pool is not an
+// error and not a reason to guess a bigger number at startup: the cursor moves
+// to the next pool and a new one is created if this frame has never gone that
+// deep. Pools live for the device's lifetime and are reset, not freed, at the
+// start of each frame, so a run settles on however many its heaviest frame
+// needs and allocates no more after that.
+VkDescriptorSet VulkanCommandList::allocateDescriptorSet(VkDescriptorSetLayout layout) {
+    VkDevice device = m_device.m_device.device;
+
+    for (;;) {
+        if (m_frame->poolCursor >= m_frame->descriptorPools.size()) {
+            m_frame->descriptorPools.push_back(m_device.createDescriptorPool());
+        }
+
+        const VkDescriptorSetAllocateInfo allocInfo{
+            .sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext              = nullptr,
+            .descriptorPool     = m_frame->descriptorPools[m_frame->poolCursor],
+            .descriptorSetCount = 1,
+            .pSetLayouts        = &layout,
+        };
+        VkDescriptorSet set = VK_NULL_HANDLE;
+
+        const VkResult result = vkAllocateDescriptorSets(device, &allocInfo, &set);
+        if (result == VK_SUCCESS) {
+            return set;
+        }
+        if (result != VK_ERROR_OUT_OF_POOL_MEMORY && result != VK_ERROR_FRAGMENTED_POOL) {
+            checkResult(result, "vkAllocateDescriptorSets");
+        }
+        ++m_frame->poolCursor;
+    }
+}
+
 void VulkanCommandList::flushBindings() {
     const Pipeline& pipeline = m_device.m_pipelines.get(m_pipeline);
 
@@ -116,15 +150,7 @@ void VulkanCommandList::flushBindings() {
         return;
     }
 
-    const VkDescriptorSetAllocateInfo allocInfo{
-        .sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-        .pNext              = nullptr,
-        .descriptorPool     = m_descriptorPool,
-        .descriptorSetCount = 1,
-        .pSetLayouts        = &pipeline.setLayout,
-    };
-    VkDescriptorSet set = VK_NULL_HANDLE;
-    FITZEL_CHECK(vkAllocateDescriptorSets(m_device.m_device.device, &allocInfo, &set));
+    const VkDescriptorSet set = allocateDescriptorSet(pipeline.setLayout);
 
     // The infos must outlive vkUpdateDescriptorSets, hence the reserved
     // vectors rather than per-iteration temporaries.

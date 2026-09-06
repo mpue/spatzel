@@ -300,7 +300,8 @@ void Editor::buildPropertiesPanel(std::vector<GpuPrimitive>& scene, EditorAction
 }
 
 void Editor::buildScenePanel(std::vector<GpuPrimitive>& scene, AnimationClip& anim,
-                             EditorActions& actions, const std::filesystem::path& sceneDir) {
+                             fluid::Settings& fluidSettings, EditorActions& actions,
+                             const std::filesystem::path& sceneDir) {
     if (!ImGui::Begin("Scene")) {
         ImGui::End();
         return;
@@ -317,7 +318,7 @@ void Editor::buildScenePanel(std::vector<GpuPrimitive>& scene, AnimationClip& an
     ImGui::SameLine();
     if (ImGui::Button("Save")) {
         try {
-            saveScene(resolve(m_fileName), scene, &anim);
+            saveScene(resolve(m_fileName), scene, &anim, &fluidSettings);
             m_status = std::string("Saved ") + m_fileName;
         } catch (const std::exception& e) {
             m_status = std::string("Save failed: ") + e.what();
@@ -330,11 +331,16 @@ void Editor::buildScenePanel(std::vector<GpuPrimitive>& scene, AnimationClip& an
             // snapshot taken afterwards would pair the old scene with the new
             // animation. Pushed only once the load actually succeeded.
             Snapshot before = snapshot(scene);
-            std::vector<GpuPrimitive> loaded = loadScene(resolve(m_fileName), &anim);
+            std::vector<GpuPrimitive> loaded =
+                loadScene(resolve(m_fileName), &anim, &fluidSettings);
             pushUndo(std::move(before));
             scene = std::move(loaded);
             clampSelection(scene);
             actions.sceneChanged = actions.bakeMeasure = true;
+            // The file may carry a different tank: re-voxelise the obstacles and
+            // re-seed, so a loaded dam break starts from its own initial state
+            // rather than from whatever was sloshing a moment ago.
+            actions.fluidDomainMoved = actions.fluidReset = true;
             m_status = std::string("Loaded ") + m_fileName;
         } catch (const std::exception& e) {
             m_status = std::string("Load failed: ") + e.what();
@@ -357,11 +363,13 @@ void Editor::buildScenePanel(std::vector<GpuPrimitive>& scene, AnimationClip& an
                 if (ImGui::Button(name.c_str())) {
                     try {
                         Snapshot before = snapshot(scene); // see the Load button above
-                        std::vector<GpuPrimitive> loaded = loadScene(entry.path(), &anim);
+                        std::vector<GpuPrimitive> loaded =
+                            loadScene(entry.path(), &anim, &fluidSettings);
                         pushUndo(std::move(before));
                         scene = std::move(loaded);
                         clampSelection(scene);
                         actions.sceneChanged = actions.bakeMeasure = true;
+                        actions.fluidDomainMoved = actions.fluidReset = true;
                         std::snprintf(m_fileName, sizeof(m_fileName), "%s", name.c_str());
                         m_status = "Loaded " + name;
                     } catch (const std::exception& e) {

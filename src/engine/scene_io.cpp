@@ -2,6 +2,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
 #include <fstream>
 #include <stdexcept>
@@ -73,7 +74,7 @@ std::array<float, N> readFloats(const json& node, const char* key) {
 } // namespace
 
 void saveScene(const std::filesystem::path& path, const std::vector<GpuPrimitive>& scene,
-               const AnimationClip* anim) {
+               const AnimationClip* anim, const fluid::Settings* fluidSettings) {
     json primitives = json::array();
     for (const GpuPrimitive& p : scene) {
         primitives.push_back(json{
@@ -91,7 +92,7 @@ void saveScene(const std::filesystem::path& path, const std::vector<GpuPrimitive
             {"transmission", p.material[3]},
         });
     }
-    json document{{"version", 3}, {"primitives", std::move(primitives)}};
+    json document{{"version", 4}, {"primitives", std::move(primitives)}};
 
     // Keyframe tracks, keyed by object id. Only non-empty tracks are written.
     if (anim != nullptr) {
@@ -118,6 +119,34 @@ void saveScene(const std::filesystem::path& path, const std::vector<GpuPrimitive
         }
     }
 
+    // The water. Written whole rather than as a diff against the defaults: a
+    // scene file is meant to be readable and hand-editable, and a partial block
+    // would leave the reader guessing which knobs are in play.
+    if (fluidSettings != nullptr && fluidSettings->enabled) {
+        const fluid::Settings& f = *fluidSettings;
+        document["fluid"] = json{
+            {"enabled", f.enabled},
+            {"resolution", f.res},
+            {"origin", {f.origin.x, f.origin.y, f.origin.z}},
+            {"size", f.size},
+            {"timestep", f.timestep},
+            {"maxSubsteps", f.maxSubsteps},
+            {"gravity", f.gravity},
+            {"pressureSweeps", f.pressureSweeps},
+            {"extrapolateSweeps", f.extrapolateSweeps},
+            {"reinitIterations", f.reinitIterations},
+            {"seedMin", {f.seedMin.x, f.seedMin.y, f.seedMin.z}},
+            {"seedMax", {f.seedMax.x, f.seedMax.y, f.seedMax.z}},
+            {"poolLevel", f.poolLevel},
+            {"colour", {f.colour[0], f.colour[1], f.colour[2]}},
+            {"transmission", f.transmission},
+            {"roughness", f.roughness},
+            {"ior", f.ior},
+            {"trustBandCells", f.trustBandCells},
+            {"surfaceOffset", f.surfaceOffset},
+        };
+    }
+
     std::ofstream file(path, std::ios::trunc);
     if (!file) {
         throw std::runtime_error("scene: cannot write " + path.string());
@@ -128,7 +157,8 @@ void saveScene(const std::filesystem::path& path, const std::vector<GpuPrimitive
     }
 }
 
-std::vector<GpuPrimitive> loadScene(const std::filesystem::path& path, AnimationClip* anim) {
+std::vector<GpuPrimitive> loadScene(const std::filesystem::path& path, AnimationClip* anim,
+                                    fluid::Settings* fluidSettings) {
     std::ifstream file(path);
     if (!file) {
         throw std::runtime_error("scene: cannot read " + path.string());
@@ -211,6 +241,59 @@ std::vector<GpuPrimitive> loadScene(const std::filesystem::path& path, Animation
             }
         }
     }
+    // The water (schema v4+). Absent -> the caller keeps whatever it had, so an
+    // older file loaded into a running editor leaves the tank alone rather than
+    // silently resetting it to the defaults.
+    if (fluidSettings != nullptr && document.contains("fluid")) {
+        const auto&     f = document.at("fluid");
+        fluid::Settings s = *fluidSettings;
+
+        s.enabled           = f.value("enabled", s.enabled);
+        s.res               = f.value("resolution", s.res);
+        s.size              = f.value("size", s.size);
+        s.timestep          = f.value("timestep", s.timestep);
+        s.maxSubsteps       = f.value("maxSubsteps", s.maxSubsteps);
+        s.gravity           = f.value("gravity", s.gravity);
+        s.pressureSweeps    = f.value("pressureSweeps", s.pressureSweeps);
+        s.extrapolateSweeps = f.value("extrapolateSweeps", s.extrapolateSweeps);
+        s.reinitIterations  = f.value("reinitIterations", s.reinitIterations);
+        s.poolLevel         = f.value("poolLevel", s.poolLevel);
+        s.transmission      = f.value("transmission", s.transmission);
+        s.roughness         = f.value("roughness", s.roughness);
+        s.ior               = f.value("ior", s.ior);
+        s.trustBandCells    = f.value("trustBandCells", s.trustBandCells);
+        s.surfaceOffset     = f.value("surfaceOffset", s.surfaceOffset);
+
+        if (f.contains("origin")) {
+            const auto v = readFloats<3>(f, "origin");
+            s.origin      = {v[0], v[1], v[2]};
+        }
+        if (f.contains("seedMin")) {
+            const auto v = readFloats<3>(f, "seedMin");
+            s.seedMin     = {v[0], v[1], v[2]};
+        }
+        if (f.contains("seedMax")) {
+            const auto v = readFloats<3>(f, "seedMax");
+            s.seedMax     = {v[0], v[1], v[2]};
+        }
+        if (f.contains("colour")) {
+            const auto v = readFloats<3>(f, "colour");
+            for (int c = 0; c < 3; ++c) {
+                s.colour[c] = v[c];
+            }
+        }
+
+        // Clamped on the way in: a hand-edited file is exactly where an
+        // out-of-range resolution or a zero timestep would come from, and the
+        // solver would divide by it.
+        s.res         = std::clamp(s.res, fluid::kMinRes, fluid::kMaxRes);
+        s.size        = std::max(s.size, 0.01f);
+        s.timestep    = std::clamp(s.timestep, 1.0e-5f, 1.0f);
+        s.maxSubsteps = std::clamp(s.maxSubsteps, 1, 64);
+
+        *fluidSettings = s;
+    }
+
     return scene;
 }
 

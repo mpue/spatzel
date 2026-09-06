@@ -6,6 +6,7 @@
 #include "engine/brick.hpp"
 #include "engine/camera.hpp"
 #include "engine/editor.hpp"
+#include "engine/fluid_sim.hpp"
 #include "engine/render_mode.hpp"
 #include "engine/scene.hpp"
 #include "platform/window.hpp"
@@ -31,6 +32,9 @@ struct AppConfig {
     uint64_t              maxFrames   = 0;
 
     RendererMode          renderer    = RendererMode::Brick;
+    // Switch the water on at startup (--fluid). Off by default: the solver
+    // allocates nothing and costs nothing until it is enabled.
+    bool                  fluid       = false;
     // 0 = shaded, 1 = step-count heat, 2 = brick/empty tint. Brick renderer only.
     int32_t               debugView   = 0;
     // Show the Dear ImGui editor panel. Forced off for pinned verification runs
@@ -68,6 +72,8 @@ public:
 
 private:
     void renderFrame();
+    // Wall-clock seconds the fluid solver is asked to catch up on this frame.
+    [[nodiscard]] float fluidFrameSeconds() const;
     void resizeRenderTarget(rhi::Extent2D extent);
     void destroyRenderTarget();
 
@@ -244,8 +250,22 @@ private:
     std::filesystem::path m_sceneDir; // where scenes are saved/loaded from
     float                 m_smoothedFrametime = 0.0f; // for a steady FPS readout
 
+    // The water. Owns its field buffers and its nine compute passes; the engine
+    // owns only the settings, when to step, and where the two buffers the
+    // marchers read are bound (slots 8 and 11). Nothing is allocated until the
+    // fluid is switched on.
+    FluidSim        m_fluid;
+    fluid::Settings m_fluidSettings;
+    fluid::Stats    m_fluidStats;
+    // Frames since the last diagnostics readback. The readback stalls the
+    // device, exactly like the brick bake's, so it runs on an interval rather
+    // than every frame — the figures move slowly enough for that to be honest.
+    uint32_t        m_fluidStatsAge = 0;
+
     FlyCamera m_camera;
     double    m_lastFrameTime = 0.0;
+    // The frame delta the solver is stepped with, captured by the main loop.
+    float     m_frameDelta    = 0.0f;
 
     uint64_t m_maxFrames   = 0;
     uint64_t m_framesDrawn = 0;

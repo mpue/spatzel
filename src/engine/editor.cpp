@@ -150,6 +150,7 @@ void Editor::setupDockLayout(unsigned int dockId) {
     ImGui::DockBuilderDockWindow("Properties", leftBottom);
     ImGui::DockBuilderDockWindow("Renderer", rightTop);
     ImGui::DockBuilderDockWindow("Lighting", rightMid);
+    ImGui::DockBuilderDockWindow("Fluid", rightMid); // tabbed with Lighting
     ImGui::DockBuilderDockWindow("Vegetation", rightBottom);
     ImGui::DockBuilderDockWindow("Scene", rightBottom); // tabbed with Vegetation
     ImGui::DockBuilderDockWindow("Timeline", bottom);
@@ -157,7 +158,8 @@ void Editor::setupDockLayout(unsigned int dockId) {
 }
 
 EditorActions Editor::draw(std::vector<GpuPrimitive>& scene, RendererMode& renderer,
-                           RenderSettings& render, LightingSettings& lighting, AnimationClip& anim,
+                           RenderSettings& render, LightingSettings& lighting,
+                           fluid::Settings& fluidSettings, AnimationClip& anim,
                            AnimationState& animState, const ViewportCamera& camera,
                            bool brickAvailable, const EditorStats& stats,
                            const std::filesystem::path& sceneDir) {
@@ -192,9 +194,10 @@ EditorActions Editor::draw(std::vector<GpuPrimitive>& scene, RendererMode& rende
     buildPrimitivesPanel(scene, stats, actions);
     buildPropertiesPanel(scene, actions);
     buildLightingPanel(lighting, actions);
+    buildFluidPanel(fluidSettings, stats, actions);
     buildLSystemPanel(scene, stats, actions);
     buildTimelinePanel(scene, anim, animState, camera);
-    buildScenePanel(scene, anim, actions, sceneDir);
+    buildScenePanel(scene, anim, fluidSettings, actions, sceneDir);
 
     return actions;
 }

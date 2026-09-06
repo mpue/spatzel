@@ -1,0 +1,33 @@
+#version 450 core
+
+// Obstacle voxelisation: samples the SCENE distance field at every cell centre
+// and stores it.
+//
+// This is the whole collision system. There is no second collision
+// representation, no convex hull, no triangle soup — the edit list that defines
+// what the renderer draws is the same list that defines what the water flows
+// around, evaluated by the same shared code (sdf_scene.glsl). Adding an
+// obstacle to the tank is adding a primitive in the editor.
+//
+// Runs only when the scene changes, not per step: the obstacles are static
+// within a frame. Animated primitives therefore need a re-run per frame, which
+// the engine already does whenever the edit list is re-uploaded.
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+#define FLUID_PUSH
+#define FLUID_SOLID_W
+#include "fluid_common.glsl"
+
+#include "sdf_scene.glsl" // the edit list at slot 1
+
+void main() {
+    const ivec3 id  = ivec3(gl_GlobalInvocationID);
+    const int   res = u.control.x;
+    if (any(greaterThanEqual(id, ivec3(res)))) {
+        return;
+    }
+
+    const vec3 p = fluidCellCentre(u.domain.xyz, u.domain.w, id);
+    gSolidOut[fluidCellIndex(id, res)] = sceneDistance(p, u.control.y);
+}

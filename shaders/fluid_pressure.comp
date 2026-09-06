@@ -1,0 +1,90 @@
+#version 450 core
+
+// One colour of one red-black Gauss-Seidel sweep of the pressure Poisson
+// equation. The engine dispatches this twice per sweep — parity 0, then 1 — and
+// as many sweeps per step as the settings ask for.
+//
+// Why red-black Gauss-Seidel and not Jacobi: Jacobi was the first thing here and
+// it did not converge anywhere near fast enough to hold up a column of water.
+// Information travels one cell per iteration either way, but Jacobi's every cell
+// reads a whole sweep of stale neighbours, and at 64 cells deep a hydrostatic
+// column needs the pressure at the bottom to know about the surface. Colouring
+// the grid like a checkerboard makes every neighbour of a red cell black, so a
+// red sweep can update in place and the black sweep that follows reads this
+// step's answer rather than the previous one's. Same arithmetic, same memory
+// traffic, no second buffer, and roughly twice the convergence rate — and unlike
+// Jacobi it needs no ping-pong at all.
+//
+// The pressure field is also warm-started: it is not cleared between steps, so a
+// settled pool begins each solve from the answer that already held it up. That
+// makes the solve's result depend on the history, which is a real cost and the
+// reason the residual is measured rather than assumed (fluid_stats.comp).
+//
+// The discretisation, with density folded to 1:
+//
+//     laplacian(p) = div(u) / dt
+//     (sum over open neighbours of (p_c - p_nb)) / h^2 = div_c / dt
+//     p_c = (sum of open neighbour pressures - h^2 * div_c / dt) / openCount
+//
+// Two boundary conditions fall out of which neighbours are counted:
+//   - solid neighbour (obstacle or tank wall): not counted at all. That is the
+//     Neumann condition dp/dn = 0, i.e. no flow through the boundary.
+//   - air neighbour: counted, but contributes pressure 0. That is the Dirichlet
+//     condition at the free surface, and it is what makes the water fall rather
+//     than behave like a sealed box.
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+#define FLUID_PUSH
+#define FLUID_PHI_SRC
+#define FLUID_SOLID_R
+#define FLUID_DIVERGENCE_R
+#define FLUID_PRESSURE
+#include "fluid_common.glsl"
+
+void main() {
+    const ivec3 id  = ivec3(gl_GlobalInvocationID);
+    const int   res = u.control.x;
+    if (any(greaterThanEqual(id, ivec3(res)))) {
+        return;
+    }
+
+    // control.z carries the colour this dispatch owns.
+    if (((id.x + id.y + id.z) & 1) != u.control.z) {
+        return;
+    }
+
+    const int cell = fluidCellIndex(id, res);
+    if (!fluidIsWater(id, res)) {
+        gPressure[cell] = 0.0; // air and obstacles carry no unknown
+        return;
+    }
+
+    float sum  = 0.0;
+    int   open = 0;
+
+    for (int axis = 0; axis < 3; ++axis) {
+        for (int side = -1; side <= 1; side += 2) {
+            ivec3 nb = id;
+            nb[axis] += side;
+
+            const bool outside = nb[axis] < 0 || nb[axis] >= res;
+            if (outside || fluidSolidCell(nb, res)) {
+                continue; // Neumann: the wall carries no pressure unknown
+            }
+            ++open;
+            if (fluidPhiAt(nb, res) < 0.0) {
+                sum += gPressure[fluidCellIndex(nb, res)];
+            }
+            // else: air, Dirichlet p = 0, counted but contributing nothing.
+        }
+    }
+
+    if (open == 0) {
+        gPressure[cell] = 0.0; // a cell sealed on all six sides has no say
+        return;
+    }
+
+    const float h = u.domain.w;
+    gPressure[cell] = (sum - h * h * gDivergence[cell] / u.step.x) / float(open);
+}

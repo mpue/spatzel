@@ -1,0 +1,57 @@
+#version 450 core
+
+// Initial state. Writes the level set from an analytic shape and zeroes every
+// velocity and pressure sample, so a reset is one dispatch and is bit-for-bit
+// reproducible — which is what lets a pinned-time verification run mean
+// anything once water is in the frame.
+//
+// The initial water is the union of a box (the dam) and a half-space below a
+// still-water level (the pool it falls into). Both are exact signed distance
+// functions and a union is a min, so the seeded field is already a proper SDF
+// and the first reinit pass has nothing to correct.
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+#define FLUID_PUSH
+#define FLUID_VEL_DST
+#define FLUID_PHI_DST
+#define FLUID_PRESSURE
+#include "fluid_common.glsl"
+
+float sdBoxExact(vec3 p, vec3 lo, vec3 hi) {
+    const vec3 centre   = 0.5 * (lo + hi);
+    const vec3 halfSize = 0.5 * (hi - lo);
+    const vec3 q        = abs(p - centre) - halfSize;
+    return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
+}
+
+void main() {
+    const ivec3 id  = ivec3(gl_GlobalInvocationID);
+    const int   res = u.control.x;
+    if (any(greaterThan(id, ivec3(res)))) {
+        return;
+    }
+
+    // Faces: the whole shared lattice, including the slack entries no component
+    // reads. Seeding them too keeps the buffer free of NaNs from uninitialised
+    // device memory, which a trilinear read at the boundary could otherwise
+    // pull in.
+    for (int axis = 0; axis < 3; ++axis) {
+        gVelDst[fluidVelIndex(axis, id, res)] = 0.0;
+    }
+
+    if (any(greaterThanEqual(id, ivec3(res)))) {
+        return;
+    }
+
+    const int   cell   = fluidCellIndex(id, res);
+    const vec3  origin = u.domain.xyz;
+    const float h      = u.domain.w;
+    const vec3  p      = fluidCellCentre(origin, h, id);
+
+    const float dam  = sdBoxExact(p, u.seedMin.xyz, u.seedMax.xyz);
+    const float pool = p.y - u.seedMin.w; // half-space below the still-water level
+
+    gPhiDst[cell]      = min(dam, pool);
+    gPressure[cell] = 0.0;
+}

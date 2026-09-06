@@ -78,6 +78,7 @@ add_library(fitzel_engine STATIC
     engine/camera.cpp
     engine/scene.cpp
     engine/scene_io.cpp
+    engine/fluid_sim.cpp
     engine/lsystem.cpp
     engine/animation.cpp
     engine/ui_theme.cpp
@@ -85,6 +86,7 @@ add_library(fitzel_engine STATIC
     engine/editor_panels.cpp
     engine/editor_gizmo.cpp
     engine/editor_lighting.cpp
+    engine/editor_fluid.cpp
     engine/editor_lsystem.cpp
     engine/editor_timeline.cpp)
 target_link_libraries(fitzel_engine

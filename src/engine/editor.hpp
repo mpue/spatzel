@@ -13,6 +13,7 @@
 
 #include "engine/animation.hpp"
 #include "engine/brick.hpp"
+#include "engine/fluid.hpp"
 #include "engine/lsystem.hpp"
 #include "engine/mat4.hpp"
 #include "engine/render_mode.hpp"
@@ -33,6 +34,9 @@ struct EditorStats {
     int         maxPrimitives  = 0;
     float       lastBakeMs     = 0.0f;
     bool        haveBake       = false; // a brick re-bake has been timed
+    // What the solver's diagnostics pass measured, for the Fluid panel to show.
+    // Display only: the panel never writes these back.
+    fluid::Stats fluid{};
 };
 
 // The camera, handed to the editor each frame so it can drive the transform
@@ -56,6 +60,12 @@ struct EditorActions {
     bool rebake       = false; // brick structure needs rebuilding, but the scene did
                                // not change (e.g. the grid resolution was retuned)
     bool lightingChanged = false; // lighting edited this frame -> re-upload the light buffer
+
+    // The water. A reset re-seeds the level set (and re-baselines the volume
+    // figure); a domain move re-voxelises the obstacles, because the obstacle
+    // field is a sample of the scene taken at the domain's cell centres.
+    bool fluidReset        = false;
+    bool fluidDomainMoved  = false;
 
     // A viewport click asked for a pick: the engine marches this ray and reports
     // the hit primitive back via Editor::setSelected. Origin/dir are world-space.
@@ -110,7 +120,8 @@ public:
     // directly. `sceneDir` is where scene files are saved and where example
     // scenes are listed from.
     EditorActions draw(std::vector<GpuPrimitive>& scene, RendererMode& renderer,
-                       RenderSettings& render, LightingSettings& lighting, AnimationClip& anim,
+                       RenderSettings& render, LightingSettings& lighting,
+                       fluid::Settings& fluidSettings, AnimationClip& anim,
                        AnimationState& animState, const ViewportCamera& camera, bool brickAvailable,
                        const EditorStats& stats, const std::filesystem::path& sceneDir);
 
@@ -214,10 +225,13 @@ private:
                               EditorActions& actions);
     void buildPropertiesPanel(std::vector<GpuPrimitive>& scene, EditorActions& actions);
     void buildScenePanel(std::vector<GpuPrimitive>& scene, AnimationClip& anim,
-                         EditorActions& actions, const std::filesystem::path& sceneDir);
+                         fluid::Settings& fluidSettings, EditorActions& actions,
+                         const std::filesystem::path& sceneDir);
     void buildLSystemPanel(std::vector<GpuPrimitive>& scene, const EditorStats& stats,
                            EditorActions& actions);
     void buildLightingPanel(LightingSettings& lighting, EditorActions& actions);
+    void buildFluidPanel(fluid::Settings& fluidSettings, const EditorStats& stats,
+                         EditorActions& actions);
     void buildTimelinePanel(std::vector<GpuPrimitive>& scene, AnimationClip& anim,
                             AnimationState& animState, const ViewportCamera& camera);
     LSystemConfig lsysConfig() const; // assemble a config from the UI fields

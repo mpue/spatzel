@@ -69,8 +69,9 @@ Application::Application(const AppConfig& config)
     // at slot 1. It is allocated at full capacity so the editor can add
     // primitives without reallocating a GPU resource mid-frame; only the active
     // prefix is uploaded and only primitiveCount of it is ever read.
-    m_scene =
-        config.scenePath.empty() ? buildScene() : loadScene(config.scenePath, &m_animClip);
+    m_scene = config.scenePath.empty()
+                  ? buildScene()
+                  : loadScene(config.scenePath, &m_animClip, &m_fluidSettings);
     if (m_scene.size() > kMaxPrimitives) {
         m_scene.resize(kMaxPrimitives);
     }
@@ -94,10 +95,15 @@ Application::Application(const AppConfig& config)
 
     // --- reference renderer: render target (0) + edit list (1) + lighting (5) -
     m_refShader = m_device->createShader("raymarch");
-    constexpr std::array<rhi::BindingDesc, 3> refBindings{
+    constexpr std::array<rhi::BindingDesc, 5> refBindings{
         rhi::BindingDesc{.slot = 0, .type = rhi::BindingType::StorageTexture},
         rhi::BindingDesc{.slot = 1, .type = rhi::BindingType::StorageBuffer},
-        rhi::BindingDesc{.slot = 5, .type = rhi::BindingType::StorageBuffer}};
+        rhi::BindingDesc{.slot = 5, .type = rhi::BindingType::StorageBuffer},
+        // The water: its parameter block and its level set. Declared
+        // unconditionally — the marcher is one binary either way and reads
+        // `enabled` out of the parameter block to decide whether to look.
+        rhi::BindingDesc{.slot = 8, .type = rhi::BindingType::StorageBuffer},
+        rhi::BindingDesc{.slot = 11, .type = rhi::BindingType::StorageBuffer}};
     m_refPipeline = m_device->createComputePipeline({
         .cs               = m_refShader,
         .pushConstantSize = sizeof(SceneUniforms),
@@ -106,6 +112,15 @@ Application::Application(const AppConfig& config)
     });
 
     createBrickResources();
+
+    // The fluid solver: pipelines now, field buffers only once it is switched
+    // on. The parameter block exists from the start because both marchers bind
+    // it every frame.
+    m_fluid.create(*m_device);
+    // --fluid switches the water on; it never switches off what a scene file
+    // asked for, so the flag and the file compose instead of fighting.
+    m_fluidSettings.enabled = m_fluidSettings.enabled || config.fluid;
+    m_fluid.uploadParams(m_fluidSettings);
 
     resizeRenderTarget(m_device->swapchainExtent());
 
@@ -218,12 +233,14 @@ void Application::createBrickResources() {
     });
 
     m_brickShader = m_device->createShader("raymarch_brick");
-    constexpr std::array<rhi::BindingDesc, 5> brickBindings{
+    constexpr std::array<rhi::BindingDesc, 7> brickBindings{
         rhi::BindingDesc{.slot = 0, .type = rhi::BindingType::StorageTexture}, // output
         rhi::BindingDesc{.slot = 1, .type = rhi::BindingType::StorageBuffer},  // scene
         rhi::BindingDesc{.slot = 2, .type = rhi::BindingType::StorageBuffer},  // cells
         rhi::BindingDesc{.slot = 3, .type = rhi::BindingType::StorageBuffer},  // bricks
         rhi::BindingDesc{.slot = 5, .type = rhi::BindingType::StorageBuffer},  // lighting
+        rhi::BindingDesc{.slot = 8, .type = rhi::BindingType::StorageBuffer},  // fluid params
+        rhi::BindingDesc{.slot = 11, .type = rhi::BindingType::StorageBuffer}, // fluid level set
     };
     m_brickPipeline = m_device->createComputePipeline({
         .cs               = m_brickShader,
@@ -259,6 +276,7 @@ Application::~Application() {
     // No idle wait for the rest: destruction is safe to request at any time, and
     // a backend that can still have work in flight defers the release itself.
     destroyRenderTarget();
+    m_fluid.destroy();
     for (rhi::BufferHandle buffer : {m_sceneBuffer, m_cellsBuffer, m_bricksBuffer, m_statsBuffer}) {
         if (rhi::isValid(buffer)) {
             m_device->destroy(buffer);
@@ -356,6 +374,7 @@ bool Application::run() {
         const float deltaSeconds =
             std::clamp(static_cast<float>(now - m_lastFrameTime), 0.0f, 0.1f);
         m_lastFrameTime = now;
+        m_frameDelta    = deltaSeconds;
         // Exponential smoothing so the FPS readout does not flicker.
         m_smoothedFrametime = m_smoothedFrametime > 0.0f
                                   ? m_smoothedFrametime + 0.1f * (deltaSeconds - m_smoothedFrametime)
@@ -485,6 +504,7 @@ void Application::buildUi() {
     stats.maxPrimitives  = static_cast<int>(kMaxPrimitives);
     stats.lastBakeMs     = m_lastBakeMs;
     stats.haveBake       = m_haveBake;
+    stats.fluid          = m_fluidStats;
 
     // The camera the editor needs for the gizmo (view/projection) and the pick
     // ray (basis + fov). View/projection are reconstructed to match the marcher's
@@ -508,8 +528,8 @@ void Application::buildUi() {
     vpCam.aspect     = aspect;
 
     const EditorActions actions =
-        m_editor.draw(m_scene, m_renderer, m_render, m_lighting, m_animClip, m_animState, vpCam,
-                      /*brickAvailable=*/true, stats, m_sceneDir);
+        m_editor.draw(m_scene, m_renderer, m_render, m_lighting, m_fluidSettings, m_animClip,
+                      m_animState, vpCam, /*brickAvailable=*/true, stats, m_sceneDir);
 
     if (actions.pickRequested) {
         // Stage the ray; the pick pass is recorded into this frame and read back
@@ -526,9 +546,11 @@ void Application::buildUi() {
     if (actions.sceneChanged || actions.bakeMeasure) {
         // The edit list is the single source of truth; push it to the GPU and
         // ask for a re-bake. The reference renderer needs nothing more — it
-        // re-reads the list every frame.
+        // re-reads the list every frame. The fluid's obstacle field is a sample
+        // of that same list, so it is stale now too.
         uploadScene();
         m_needBake = true;
+        m_fluid.invalidateSolids();
     }
     if (actions.rebake) {
         // The structure needs rebuilding but the edit list did not change (a
@@ -539,6 +561,14 @@ void Application::buildUi() {
         // Lighting lives in its own buffer the marchers read every frame; just
         // re-upload it. No re-bake — the bricks hold distance, not shading.
         uploadLighting();
+    }
+    if (actions.fluidDomainMoved) {
+        // The obstacle field is a sample of the scene distance field taken at
+        // the domain's cell centres, so moving the domain invalidates it.
+        m_fluid.invalidateSolids();
+    }
+    if (actions.fluidReset) {
+        m_fluid.requestReset();
     }
     if (actions.bakeMeasure) {
         // A committed edit (a finished drag, an add/delete, undo/redo, a load):
@@ -568,6 +598,9 @@ void Application::renderFrame() {
         if (sampleInto(m_animClip, m_animState.time, m_scene)) {
             uploadScene();
             m_needBake = true;
+            // Obstacles are the edit list, so an animated primitive moves the
+            // walls the water flows around.
+            m_fluid.invalidateSolids();
         }
         // The camera track drives the camera directly (no scene upload/bake — the
         // camera only feeds the marcher uniforms, read fresh every frame).
@@ -596,6 +629,15 @@ void Application::renderFrame() {
     // re-reads the edit list every frame and needs no bake — so per-frame
     // animation stays smooth instead of re-baking the whole brick grid each frame.
     // The pending bake is deferred until playback stops and the brick view returns.
+    // The water is stepped before anything that draws it, into the same command
+    // list: the RHI orders dispatches against each other, so the marcher below
+    // sees exactly what the solver just wrote, with no barrier spelled out here.
+    m_fluid.recordStep(cmd, m_fluidSettings, m_sceneBuffer, static_cast<int>(m_scene.size()),
+                       fluidFrameSeconds());
+    // After recording, because the block carries the resolution the fields were
+    // actually seeded at — which recordStep may have just changed.
+    m_fluid.uploadParams(m_fluidSettings);
+
     const bool         previewRef = m_animState.playing && m_animState.previewReference;
     const RendererMode eff = previewRef ? RendererMode::Reference : m_renderer;
 
@@ -640,6 +682,20 @@ void Application::renderFrame() {
         m_bakePending = false;
     }
 
+    // Fluid diagnostics. readStats blocks on the submitted frame exactly as the
+    // bake stats readback does, so it runs on an interval: the volume and the
+    // residual divergence are slow-moving numbers and do not need a stall per
+    // frame to be truthful.
+    if (m_fluidSettings.enabled && m_fluid.resident()) {
+        constexpr uint32_t kStatsInterval = 15;
+        if (++m_fluidStatsAge >= kStatsInterval) {
+            m_fluidStatsAge = 0;
+            (void)m_fluid.readStats(m_fluidSettings, m_fluidStats);
+        }
+    } else {
+        m_fluidStats = fluid::Stats{};
+    }
+
     if (m_pickPending) {
         // The pick pass wrote the hit index this frame; read it back (blocks on
         // the frame like the bake stats do) and hand it to the editor. -1 on a
@@ -651,6 +707,19 @@ void Application::renderFrame() {
         m_editor.applyPick(index);
         m_pickPending = false;
     }
+}
+
+float Application::fluidFrameSeconds() const {
+    // A pinned run has to reproduce, and a solver driven by the wall clock does
+    // not: two runs would step the water a different number of times and diverge
+    // immediately. So a pinned run spends a fixed substep budget per frame and
+    // the water's state becomes a function of the frame index alone. Same
+    // reasoning as the pinned animation clock and the frozen camera.
+    if (m_pinTime) {
+        return m_fluidSettings.timestep *
+               static_cast<float>(std::max(m_fluidSettings.maxSubsteps, 1));
+    }
+    return m_frameDelta;
 }
 
 Application::SceneUniforms Application::cameraUniforms() const {
@@ -682,6 +751,8 @@ void Application::recordReference(rhi::CommandList& cmd) {
     cmd.bindStorageTexture(0, m_renderTarget);
     cmd.bindStorageBuffer(1, m_sceneBuffer);
     cmd.bindStorageBuffer(5, m_lightingBuffer);
+    cmd.bindStorageBuffer(8, m_fluid.paramsBuffer());
+    cmd.bindStorageBuffer(11, m_fluid.phiBuffer());
     cmd.pushConstants(asBytes(uniforms));
     cmd.dispatch(divideRoundUp(m_targetExtent.width, kWorkgroupSize),
                  divideRoundUp(m_targetExtent.height, kWorkgroupSize), 1);
@@ -716,6 +787,8 @@ void Application::recordBrick(rhi::CommandList& cmd) {
     cmd.bindStorageBuffer(2, m_cellsBuffer);
     cmd.bindStorageBuffer(3, m_bricksBuffer);
     cmd.bindStorageBuffer(5, m_lightingBuffer);
+    cmd.bindStorageBuffer(8, m_fluid.paramsBuffer());
+    cmd.bindStorageBuffer(11, m_fluid.phiBuffer());
     cmd.pushConstants(asBytes(uniforms));
     cmd.dispatch(divideRoundUp(m_targetExtent.width, kWorkgroupSize),
                  divideRoundUp(m_targetExtent.height, kWorkgroupSize), 1);

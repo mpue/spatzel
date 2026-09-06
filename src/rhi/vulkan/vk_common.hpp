@@ -29,4 +29,9 @@ void setDebugName(VkDevice device, uint64_t handle, VkObjectType type, const cha
 // Number of frames the CPU may run ahead of the GPU.
 inline constexpr uint32_t kFramesInFlight = 2;
 
+// Descriptor sets one pool can hand out. A dispatch whose bindings changed takes
+// one, so this is a batch size, not a budget: a frame that needs more gets
+// another pool (see VulkanCommandList::allocateDescriptorSet).
+inline constexpr uint32_t kDescriptorPoolSets = 256;
+
 } // namespace rhi::vulkan

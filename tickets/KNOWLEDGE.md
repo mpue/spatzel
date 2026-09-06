@@ -25,8 +25,15 @@ detail into `knowledge/<topic>.md` and link it here.
   or re-bake (`application.cpp`, around the `m_editor.draw` call).
 - The editor is split by panel: `editor.cpp` (core/selection/undo/dockspace),
   `editor_panels.cpp`, `editor_gizmo.cpp`, `editor_timeline.cpp`,
-  `editor_lighting.cpp`, `editor_lsystem.cpp`; helpers in
+  `editor_lighting.cpp`, `editor_fluid.cpp`, `editor_lsystem.cpp`; helpers in
   `editor_internal.hpp`.
+- The fluid solver is `engine::FluidSim` (`fluid_sim.cpp`), layouts in
+  `fluid.hpp` mirrored by `shaders/fluid_common.glsl`. Its nine passes are
+  recorded in `recordStep`, in the order that IS the algorithm. Obstacles are the
+  edit list, sampled by `fluid_solids.comp`; the marchers read the level set at
+  slot 11 and the parameter block at slot 8. See the fluid chapter in
+  ARCHITECTURE.md before changing any of it — the three bugs documented there all
+  looked like rendering bugs and were not.
 
 ## Topics
 

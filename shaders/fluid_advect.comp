@@ -1,0 +1,76 @@
+#version 450 core
+
+// Advection and body force: one semi-Lagrangian backtrace per velocity face and
+// one per level-set cell, plus gravity on the vertical faces.
+//
+// Semi-Lagrangian advection is unconditionally stable — it interpolates, it
+// never extrapolates — so the timestep is a quality knob rather than a
+// stability one. It is also unconditionally diffusive, which for the level set
+// shows up as volume loss over time. That is the known cost of a pure grid
+// liquid and the reason particles (FLIP) are the next stage rather than a
+// bigger pressure solve; the volume drift is reported per frame instead of
+// being quietly absorbed (see fluid_stats.comp).
+//
+// One dispatch covers both fields because they share the (res+1)^3 thread grid:
+// the extra layer of threads has faces to advect and no cell.
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+#define FLUID_PUSH
+#define FLUID_VEL_SRC
+#define FLUID_VEL_DST
+#define FLUID_PHI_SRC
+#define FLUID_PHI_DST
+#define FLUID_SOLID_R
+#include "fluid_common.glsl"
+
+void main() {
+    const ivec3 id  = ivec3(gl_GlobalInvocationID);
+    const int   res = u.control.x;
+    if (any(greaterThan(id, ivec3(res)))) {
+        return;
+    }
+
+    const vec3  origin  = u.domain.xyz;
+    const float h       = u.domain.w;
+    const float dt      = u.step.x;
+    const float gravity = u.step.y;
+
+    for (int axis = 0; axis < 3; ++axis) {
+        const int index = fluidVelIndex(axis, id, res);
+        if (!fluidFaceLive(axis, id, res)) {
+            gVelDst[index] = 0.0; // slack face of the shared lattice
+            continue;
+        }
+        if (fluidFaceClosed(axis, id, res)) {
+            gVelDst[index] = 0.0; // wall or obstacle: no normal flow through it
+            continue;
+        }
+
+        const vec3  p    = fluidFacePos(axis, origin, h, id);
+        const vec3  back = fluidBacktrace(p, dt, origin, h, res);
+        float value      = fluidSampleVelocity(axis, back, origin, h, res);
+
+        // Gravity, but only where the velocity is going to be used: inside the
+        // water and in the band around it that extrapolation keeps alive.
+        // Integrating it into far air would build up a large downward velocity
+        // in cells nothing ever reads — harmless until a backtrace strays into
+        // them, at which point it is not harmless at all.
+        if (axis == 1 && fluidPhiAtFace(1, id, res) < kFluidVelocityBand * h) {
+            value += dt * gravity;
+        }
+        gVelDst[index] = value;
+    }
+
+    if (any(greaterThanEqual(id, ivec3(res)))) {
+        return;
+    }
+
+    // The level set is advected everywhere, obstacles included. Water carried
+    // into a solid is not clipped here and does not need to be: the marcher
+    // meets the obstacle's own surface first along any ray that could see it,
+    // so the buried part of the field is invisible rather than wrong.
+    const vec3 p    = fluidCellCentre(origin, h, id);
+    const vec3 back = fluidBacktrace(p, dt, origin, h, res);
+    gPhiDst[fluidCellIndex(id, res)] = fluidSamplePhi(back, origin, h, res);
+}

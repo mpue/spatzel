@@ -1,0 +1,55 @@
+#version 450 core
+
+// Pressure projection: subtract the pressure gradient from the velocity field,
+// which is the step that makes it (approximately) divergence-free.
+//
+//     u_new = u - dt * (p_right - p_left) / h
+//
+// A face only gets the update if it separates at least one fluid cell; a face
+// between two air cells has no pressure difference to speak of and is left for
+// the extrapolation pass to fill. An air cell's pressure reads as zero, which
+// is the same free-surface condition the solve used.
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+#define FLUID_PUSH
+#define FLUID_VEL_SRC
+#define FLUID_VEL_DST
+#define FLUID_PHI_SRC
+#define FLUID_SOLID_R
+#define FLUID_PRESSURE
+#include "fluid_common.glsl"
+
+// Zero in air and inside obstacles, matching the solve's boundary conditions.
+float pressureAt(ivec3 c, int res) {
+    return fluidIsWater(c, res) ? gPressure[fluidCellIndex(c, res)] : 0.0;
+}
+
+void main() {
+    const ivec3 id  = ivec3(gl_GlobalInvocationID);
+    const int   res = u.control.x;
+    if (any(greaterThan(id, ivec3(res)))) {
+        return;
+    }
+
+    const float h  = u.domain.w;
+    const float dt = u.step.x;
+
+    for (int axis = 0; axis < 3; ++axis) {
+        const int index = fluidVelIndex(axis, id, res);
+        if (!fluidFaceLive(axis, id, res) || fluidFaceClosed(axis, id, res)) {
+            gVelDst[index] = 0.0;
+            continue;
+        }
+
+        const float value = fluidVelAt(axis, id, res);
+        if (!fluidFaceSolved(axis, id, res)) {
+            gVelDst[index] = value; // air/air: nothing to project, extrapolate later
+            continue;
+        }
+
+        ivec3 lo = id;
+        lo[axis] -= 1;
+        gVelDst[index] = value - dt * (pressureAt(id, res) - pressureAt(lo, res)) / h;
+    }
+}

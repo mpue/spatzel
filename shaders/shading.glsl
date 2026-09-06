@@ -159,19 +159,23 @@ vec3 shadeHit(vec3 albedo, vec3 normal, vec3 position, vec3 rayDirection,
 // recursive internal bounces: what lies beyond the glass is shaded once, without
 // its own shadows or reflections, which is plenty convincing and bounds the cost.
 
-const float kGlassIor = 1.5; // typical crown glass
+const float kGlassIor = 1.5;  // typical crown glass
+const float kWaterIor = 1.33; // fresh water
 
-// One scene bounce: march the edit list, shade the first hit (direct + ambient,
+// One world bounce: march the combined field — the edit list unioned with the
+// water level set (fluid_field.glsl) — shade the first hit (direct + ambient,
 // no shadow ray, no further reflection) or return the sky. This is what the eye
-// sees looking along `rd` — through the glass, or in its mirror reflection.
+// sees looking along `rd`: through the glass or the water, or in its mirror
+// reflection. Marching worldSdf rather than sceneSdf is what makes a submerged
+// object visible through the surface above it.
 vec3 sceneSampleOnce(vec3 ro, vec3 rd, int primitiveCount) {
     float t = 0.0;
     for (int i = 0; i < 96; ++i) {
         const vec3  p   = ro + rd * t;
-        const Hit   h   = sceneSdf(p, primitiveCount);
+        const Hit   h   = worldSdf(p, primitiveCount);
         const float eps = 0.0006 * max(t, 1.0);
         if (h.distance < eps) {
-            const vec3 n = sceneNormal(p, primitiveCount);
+            const vec3 n = worldNormal(p, primitiveCount);
             return shadeHit(h.albedo, n, p, rd, h.material, 1.0);
         }
         t += h.distance;
@@ -182,29 +186,47 @@ vec3 sceneSampleOnce(vec3 ro, vec3 rd, int primitiveCount) {
     return background(rd);
 }
 
-// The glass appearance at a front hit: `pos`/`normal` the surface, `rd` the eye
-// ray, `tint` the glass colour (its albedo). Returns linear HDR.
-vec3 traceGlass(vec3 pos, vec3 rd, vec3 normal, vec3 tint, int primitiveCount) {
-    const float f0   = 0.04; // ((ior-1)/(ior+1))^2 for ior 1.5
+// The transmissive appearance at a front hit: `pos`/`normal` the surface, `rd`
+// the eye ray, `tint` the medium's colour (its albedo), `ior` its refractive
+// index — kGlassIor for a scene primitive, kWaterIor for the fluid surface.
+// Returns linear HDR.
+//
+// The medium is whatever the combined field says is there. That is why water
+// needed no shading model of its own: it is a transmissive surface with a low
+// roughness and an index of its own, and this path already knew how to draw one.
+vec3 traceGlass(vec3 pos, vec3 rd, vec3 normal, vec3 tint, int primitiveCount, float ior,
+                bool water) {
+    const float r0   = (ior - 1.0) / (ior + 1.0);
+    const float f0   = r0 * r0;
     const float fres = f0 + (1.0 - f0) * pow(1.0 - max(dot(-rd, normal), 0.0), 5.0);
 
     // Environment reflection off the front face.
     const vec3 reflected = sceneSampleOnce(pos + normal * 0.02, reflect(rd, normal),
                                            primitiveCount);
 
-    // Refract into the glass. (refract returns 0 on total internal reflection,
+    // Refract into the medium. (refract returns 0 on total internal reflection,
     // which cannot happen entering a denser medium, but guard anyway.)
-    const vec3 rin = refract(rd, normal, 1.0 / kGlassIor);
+    const vec3 rin = refract(rd, normal, 1.0 / ior);
     vec3       refracted;
     if (dot(rin, rin) < 1e-6) {
         refracted = reflected;
     } else {
-        // March inside the object (scene SDF is negative there) until the far
-        // surface, accumulating the path length for absorption.
+        // March inside the body until the far surface, accumulating the path
+        // length for absorption.
+        //
+        // The step comes from the MEDIUM's own field, not from the combined
+        // one. That distinction is the whole reason `water` is a parameter: the
+        // water sits on an opaque floor, and a combined field is negative
+        // inside that floor too, so a refracted ray heading downward would
+        // never find an exit — it would march on into the ground and come out
+        // of the loop somewhere underneath the world, which reads as a pool of
+        // black. Asking the medium alone puts the exit where it belongs, at the
+        // bottom of the water; whatever opaque thing is behind it gets shaded
+        // by the sample below, as any other background would.
         vec3  p      = pos + rin * 0.02;
         float inside = 0.0;
         for (int i = 0; i < 48; ++i) {
-            const float d = sceneSdf(p, primitiveCount).distance;
+            const float d = water ? fluidDistance(p) : sceneSdf(p, primitiveCount).distance;
             if (d > -0.002) {
                 break; // reached the exit surface
             }
@@ -212,10 +234,10 @@ vec3 traceGlass(vec3 pos, vec3 rd, vec3 normal, vec3 tint, int primitiveCount) {
             p += rin * s;
             inside += s;
         }
-        // Refract back out to air. The exit normal points out of the glass, so
-        // it is flipped to sit on the incident (glass) side for refract().
-        const vec3 exitN = sceneNormal(p, primitiveCount);
-        vec3       rout  = refract(rin, -exitN, kGlassIor);
+        // Refract back out to air. The exit normal points out of the body, so
+        // it is flipped to sit on the incident (interior) side for refract().
+        const vec3 exitN = water ? fluidNormal(p) : sceneNormal(p, primitiveCount);
+        vec3       rout  = refract(rin, -exitN, ior);
         if (dot(rout, rout) < 1e-6) {
             rout = reflect(rin, -exitN); // total internal reflection at the exit
         }

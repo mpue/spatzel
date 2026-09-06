@@ -49,6 +49,10 @@ layout(binding = 0, std140) uniform Uniforms {
 
 // The edit list (slot 1), the distance functions and the fold over the list.
 #include "sdf_scene.glsl"
+// The water level set (slots 8 and 11) and worldSdf, the union of the two
+// fields. Everything below marches the union, so the reference renderer is the
+// reference for the water as well as for the scene.
+#include "fluid_field.glsl"
 // The metallic-roughness PBR shading model, Fresnel/GGX helpers and tonemap.
 #include "shading.glsl"
 
@@ -57,7 +61,8 @@ layout(binding = 0, std140) uniform Uniforms {
 // distance travelled. A ray that squeaks past an edge dims proportionally,
 // giving a soft penumbra for the cost of one extra march — no shadow map, no
 // second pass. This is the reference renderer's own occlusion query; it marches
-// the same edit-list field it shades, so the shadow is exact for this path.
+// the same combined field it shades — edit list unioned with the water level
+// set — so the shadow is exact for this path, water included.
 //
 // The march stops at the light: a point light is not occluded by geometry
 // behind it. The start is pushed off the surface along the ray to keep a hit
@@ -71,11 +76,18 @@ float pointLightShadow(vec3 hit, vec3 normal, int primitiveCount) {
     float shadow = 1.0;
     float t      = 0.03;           // step off the surface to avoid self-shadow
     for (int i = 0; i < 96; ++i) {
-        const float d = sceneDistance(hit + dir * t, primitiveCount);
+        const vec3  p     = hit + dir * t;
+        const float scene = sceneDistance(p, primitiveCount);
+        const float water = fluidDistance(p);
+        const float d     = min(scene, water);
         if (d < 0.001) {
             return 0.0;            // fully occluded
         }
-        shadow = min(shadow, kSharpness * d / t);
+        // The water reading saturates at the trust band (see fluidBand): a
+        // capped value is a safe step but a lie to the penumbra estimator, so
+        // beyond the band only the scene term feeds the softening.
+        const float clearance = water < fluidBand() ? d : scene;
+        shadow = min(shadow, kSharpness * clearance / t);
         t += clamp(d, 0.01, 0.4);
         if (t >= lightDist) {
             break;                 // reached the light unobstructed
@@ -91,10 +103,10 @@ vec3 reflectionSample(vec3 origin, vec3 dir, int primitiveCount) {
     float travelled = 0.0;
     for (int step = 0; step < 128; ++step) {
         const vec3  p = origin + dir * travelled;
-        const Hit   h = sceneSdf(p, primitiveCount);
+        const Hit   h = worldSdf(p, primitiveCount);
         const float epsilon = 0.0006 * max(travelled, 1.0);
         if (h.distance < epsilon) {
-            const vec3  n  = sceneNormal(p, primitiveCount);
+            const vec3  n  = worldNormal(p, primitiveCount);
             const float sh = pointLightShadow(p + n * 0.02, n, primitiveCount);
             vec3 lit = shadeHit(h.albedo, n, p, dir, h.material, sh);
             // One bounce only: this hit gets no reflection ray of its own, so
@@ -171,7 +183,7 @@ void main() {
 
     for (int step = 0; step < kMaxSteps; ++step) {
         const vec3 p = rayOrigin + rayDirection * travelled;
-        hit = sceneSdf(p, u.primitiveCount);
+        hit = worldSdf(p, u.primitiveCount);
 
         // The threshold widens with distance: a texel covers more world space
         // further out, so demanding a fixed epsilon there only wastes steps.
@@ -189,7 +201,15 @@ void main() {
     vec3 colour;
     if (found) {
         const vec3 position = rayOrigin + rayDirection * travelled;
-        const vec3 normal   = sceneNormal(position, u.primitiveCount);
+        // Which field owns this hit. Worth one extra edit-list evaluation: the
+        // water wants its normal read at the level set's own scale — half a
+        // cell — because the sampled field is only C0 across cell boundaries
+        // and a hair-fine central difference resolves the faceting rather than
+        // the surface.
+        const bool water  = fluidDistance(position) <=
+                            sceneDistance(position, u.primitiveCount);
+        const vec3 normal = water ? fluidNormal(position)
+                                  : worldNormal(position, u.primitiveCount);
         // Start the shadow ray a touch off the surface along the normal, so the
         // penumbra estimator does not read the hit's own zero distance.
         const float shadow = pointLightShadow(position + normal * 0.02, normal,
@@ -209,8 +229,11 @@ void main() {
         // material's transmission. Marches the exact scene SDF (see shading.glsl).
         const float transmission = clamp(hit.material.w, 0.0, 1.0);
         if (transmission > 0.0) {
-            const vec3 glass = traceGlass(position, rayDirection, normal, hit.albedo,
-                                          u.primitiveCount);
+            // Water and glass share this path and differ only in their index
+            // of refraction and in which field bounds the medium.
+            const float ior = water ? gFluid.material.z : kGlassIor;
+            const vec3  glass = traceGlass(position, rayDirection, normal, hit.albedo,
+                                           u.primitiveCount, ior, water);
             lit = mix(lit, glass, transmission);
         }
 

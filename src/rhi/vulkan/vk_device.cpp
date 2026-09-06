@@ -203,6 +203,29 @@ void VulkanDevice::createAllocator() {
     FITZEL_CHECK(vmaCreateAllocator(&info, &m_allocator));
 }
 
+// A frame's descriptor pool. Sized for a comfortable batch of dispatches rather
+// than for the worst case: the worst case is unbounded (a fluid step alone
+// records over a hundred dispatches, each with its own set), so the answer is a
+// list of pools that grows on demand, not one pool guessed large enough.
+VkDescriptorPool VulkanDevice::createDescriptorPool() const {
+    const VkDescriptorPoolSize poolSizes[]{
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kDescriptorPoolSets},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kDescriptorPoolSets * 8},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kDescriptorPoolSets},
+    };
+    const VkDescriptorPoolCreateInfo info{
+        .sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .pNext         = nullptr,
+        .flags         = 0,
+        .maxSets       = kDescriptorPoolSets,
+        .poolSizeCount = static_cast<uint32_t>(std::size(poolSizes)),
+        .pPoolSizes    = poolSizes,
+    };
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    FITZEL_CHECK(vkCreateDescriptorPool(m_device.device, &info, nullptr, &pool));
+    return pool;
+}
+
 void VulkanDevice::createFrames() {
     const VkCommandPoolCreateInfo poolInfo{
         .sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -218,22 +241,6 @@ void VulkanDevice::createFrames() {
     const VkSemaphoreCreateInfo semaphoreInfo{
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = nullptr, .flags = 0};
 
-    // Sized for the handful of descriptors a milestone-1 compute pass needs;
-    // the pool is reset wholesale at the start of every frame.
-    const VkDescriptorPoolSize poolSizes[]{
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 16},
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16},
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16},
-    };
-    const VkDescriptorPoolCreateInfo descriptorPoolInfo{
-        .sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .pNext         = nullptr,
-        .flags         = 0,
-        .maxSets       = 16,
-        .poolSizeCount = static_cast<uint32_t>(std::size(poolSizes)),
-        .pPoolSizes    = poolSizes,
-    };
-
     for (Frame& frame : m_frames) {
         FITZEL_CHECK(vkCreateCommandPool(m_device.device, &poolInfo, nullptr, &frame.commandPool));
 
@@ -248,8 +255,10 @@ void VulkanDevice::createFrames() {
         FITZEL_CHECK(vkCreateFence(m_device.device, &fenceInfo, nullptr, &frame.inFlight));
         FITZEL_CHECK(
             vkCreateSemaphore(m_device.device, &semaphoreInfo, nullptr, &frame.imageAvailable));
-        FITZEL_CHECK(vkCreateDescriptorPool(m_device.device, &descriptorPoolInfo, nullptr,
-                                            &frame.descriptorPool));
+        // One pool to start with. A frame that records more dispatches than it
+        // holds grows the list instead of failing; see
+        // VulkanCommandList::allocateDescriptorSet.
+        frame.descriptorPools.push_back(createDescriptorPool());
     }
 }
 
@@ -290,9 +299,10 @@ VulkanDevice::~VulkanDevice() {
     });
 
     for (Frame& frame : m_frames) {
-        if (frame.descriptorPool != VK_NULL_HANDLE) {
-            vkDestroyDescriptorPool(m_device.device, frame.descriptorPool, nullptr);
+        for (VkDescriptorPool pool : frame.descriptorPools) {
+            vkDestroyDescriptorPool(m_device.device, pool, nullptr);
         }
+        frame.descriptorPools.clear();
         if (frame.imageAvailable != VK_NULL_HANDLE) {
             vkDestroySemaphore(m_device.device, frame.imageAvailable, nullptr);
         }
@@ -350,7 +360,10 @@ CommandList& VulkanDevice::beginFrame() {
 
     FITZEL_CHECK(vkResetFences(m_device.device, 1, &frame.inFlight));
     FITZEL_CHECK(vkResetCommandPool(m_device.device, frame.commandPool, 0));
-    FITZEL_CHECK(vkResetDescriptorPool(m_device.device, frame.descriptorPool, 0));
+    for (VkDescriptorPool pool : frame.descriptorPools) {
+        FITZEL_CHECK(vkResetDescriptorPool(m_device.device, pool, 0));
+    }
+    frame.poolCursor = 0;
 
     const VkCommandBufferBeginInfo beginInfo{
         .sType            = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -365,7 +378,7 @@ CommandList& VulkanDevice::beginFrame() {
     m_swapchainStage                  = VK_PIPELINE_STAGE_2_NONE;
     m_swapchainAccess                 = VK_ACCESS_2_NONE;
 
-    m_commandList.reset(frame.commandBuffer, frame.descriptorPool);
+    m_commandList.reset(frame.commandBuffer, frame);
     m_frameActive = true;
     return m_commandList;
 }

@@ -4,7 +4,7 @@ A portable engine base with swappable graphics backends, rendering a
 signed-distance-field scene two ways: a brute-force reference raymarcher and a
 sparse-brick-accelerated renderer validated against it.
 
-Three things in here are load-bearing:
+Four things in here are load-bearing:
 
 - the **RHI seam** — a single header describing everything the engine is
   allowed to know about the GPU. Two backends exist, Vulkan and OpenGL 4.6
@@ -17,8 +17,14 @@ Three things in here are load-bearing:
   copy of the field. It is correct exactly insofar as it reproduces the
   reference, within a documented tolerance; the reference is what makes that a
   checkable claim rather than an assertion.
+- the **fluid solver** — an Eulerian liquid on a MAC grid whose surface is a
+  level set, which is to say a signed distance field, which is to say something
+  both renderers above can already draw. It borrows the scene's own distance
+  field for its obstacles and the glass path for its shading, and adds no
+  renderer of its own.
 
-The first two exist to make the third safe rather than to be fast.
+The first two exist to make the third safe rather than to be fast. The fourth is
+what the first three were shaped to make cheap.
 
 On top of these sits an **editor**: a Dear ImGui panel that changes the scene at
 runtime and saves and loads it as JSON. It edits the parametric edit list
@@ -85,7 +91,7 @@ than crashing.
 | `src/rhi/factory.cpp` | Backend registry | `rhi.hpp` + backend headers |
 | `src/rhi/vulkan/` | Vulkan implementation | volk, VMA, vk-bootstrap, GLFW |
 | `src/rhi/opengl/` | OpenGL implementation | glad, GLFW |
-| `src/engine/` | Frame orchestration, app loop | `rhi.hpp`, platform |
+| `src/engine/` | Frame orchestration, app loop, fluid solver | `rhi.hpp`, platform |
 | `src/main.cpp` | Parses `--backend`, runs the app | engine + registry |
 
 ---
@@ -572,6 +578,277 @@ numbers.
 
 ---
 
+# The fluid
+
+Water, simulated on the GPU and rendered by the marchers that were already
+there. An Eulerian liquid on a staggered (MAC) grid whose surface is a level
+set: advection, a pressure projection, velocity extrapolation into the air, and
+redistancing — nine compute passes over eight storage buffers, driven by
+`engine::FluidSim` (`src/engine/fluid_sim.cpp`), with the layouts mirrored
+between `src/engine/fluid.hpp` and `shaders/fluid_common.glsl`.
+
+## Why a level set, and why that decides everything else
+
+The renderer marches signed distance fields. A level set **is** a signed
+distance field. So the choice of surface representation was not a simulation
+question at all — it was the question of whether the water could reach the
+screen through the union that every other surface already goes through, or
+whether it would need a mesher, a screen-space surface pass and a second
+shading path beside it.
+
+A density field would have needed all three. A particle set would have needed a
+splatting pass to become a field at all. A level set is the one representation
+this renderer can consume directly, so the water joins the scene as
+
+```glsl
+Hit worldSdf(vec3 p, int n) {          // fluid_field.glsl
+    Hit h = sceneSdf(p, n);            // the edit list
+    float w = fluidDistance(p);        // the level set
+    if (w < h.distance) { h.distance = w; /* water material */ }
+    return h;
+}
+```
+
+and nothing downstream had to learn what water is. `min` of two Lipschitz-1
+bounds is another Lipschitz-1 bound, so everything both marchers assume about
+`sceneSdf` still holds for the union.
+
+Two consequences fell out for free, and they are the argument for the choice:
+
+- **Water is a transmissive surface with an index of its own.** `traceGlass`
+  already refracted, absorbed by Beer-Lambert and composited by Fresnel; water
+  is that path with `ior` 1.33 instead of 1.5. There is no water shader.
+- **Obstacles are the edit list.** `fluid_solids.comp` samples `sceneDistance`
+  at every cell centre and stores it. That is the entire collision system —
+  no convex hulls, no triangle soup, no second scene representation. Adding a
+  rock to the tank is adding a primitive in the editor, and the water flows
+  around the same shape the renderer draws.
+
+## The grid
+
+The domain is a **cube** of `res` cells per axis with one uniform spacing `h`.
+The brick grid is deliberately stretched; this one deliberately is not. A
+non-uniform spacing turns the pressure Laplacian into a different stencil per
+axis, and the value of this first stage is a pressure solve simple enough to be
+obviously right.
+
+| Field | Layout | Note |
+|---|---|---|
+| `phi` | cell-centred, `res^3` | the level set; negative inside the water. This is also the render representation. |
+| `pressure` | cell-centred, `res^3` | single-buffered; the red-black sweep updates it in place. |
+| `divergence` | cell-centred, `res^3` | right-hand side of the Poisson equation. |
+| `solid` | cell-centred, `res^3` | the scene distance field, sampled. Negative inside an obstacle. |
+| `velocity` | staggered, `3 × (res+1)^3` | u on x-faces, v on y-faces, w on z-faces, one buffer at three offsets. |
+
+The velocity components share a uniform `(res+1)^3` lattice rather than the
+`(res+1)·res·res` a true MAC grid needs for u. The slack faces are never read;
+what the waste buys is a single index function for all three components instead
+of three that differ only in which axis is long.
+
+Buffers are sized for the resolution **ceiling**, so moving the resolution
+slider never reallocates a GPU buffer — the same trade the brick pool makes.
+Nothing is allocated at all until the fluid is first switched on, so a run that
+never touches water pays nothing for it.
+
+## A step
+
+`FluidSim::recordStep` records the whole thing into the frame's command list,
+ahead of the marcher. The order *is* the algorithm, so it lives in one function
+rather than spread through the frame loop:
+
+1. **Advect** velocity and the level set — semi-Lagrangian, RK2 backtrace — and
+   add gravity. One dispatch for both fields, because they share the thread
+   grid.
+2. **Divergence** of the advected velocity, per water cell.
+3. **Pressure**, red-black Gauss-Seidel, two dispatches per sweep.
+4. **Project**: subtract the pressure gradient.
+5. **Extrapolate** velocity a few cells into the air.
+6. **Redistance** the level set.
+
+Substeps are fixed-size and the wall clock is caught up to, never followed. A
+solver whose timestep follows the frame rate produces a result that follows the
+frame rate, and a pinned verification run could then never reproduce anything.
+A frame needing more substeps than the budget allows drops the excess rather
+than banking it, so one slow frame does not become a spiral of slower ones.
+
+## Boundary conditions
+
+Both conditions fall out of *which neighbours the stencil counts*, which is the
+part worth stating because it is where a liquid solver usually goes wrong
+quietly:
+
+- **Solid** neighbour (obstacle or tank wall): not counted at all. That is
+  `dp/dn = 0` — no flow through the boundary.
+- **Air** neighbour: counted, but contributing pressure 0. That is the Dirichlet
+  condition at the free surface, and it is what makes the water fall instead of
+  behaving like a sealed box.
+
+A face is closed if it lies on the tank wall or if either cell it separates is
+inside an obstacle — first order, and deliberately so. Fractional face areas are
+the obvious next refinement, not a correctness fix.
+
+## Three things that were wrong first, and what they cost
+
+Each of these looked like a rendering bug and was not.
+
+**Jacobi did not converge.** The pressure solve started as Jacobi, and the water
+lost 60% of its volume in a second and a half with a residual divergence of 5–24
+1/s. Information travels one cell per iteration either way, but every Jacobi cell
+reads a whole sweep of stale neighbours, and a hydrostatic column 64 cells deep
+needs the bottom to know that the surface exists. Colouring the grid like a
+checkerboard makes every neighbour of a red cell black, so a red sweep can update
+in place and the black sweep that follows reads *this* sweep's answer. Same
+arithmetic, same memory traffic, no second buffer — and with the field
+warm-started from the previous step, the residual dropped to 0.03–0.12 1/s and
+the volume drift to about 3%.
+
+**The extrapolation undid the projection.** Extrapolating velocity into the air
+is what keeps the free surface alive: without it, advection backtraces into
+still air and the splash dies. But "is this face in the air" was being decided
+from the level set averaged across the face, and a face between a water cell and
+an air cell averages positive while being fully part of the solved free-surface
+boundary. So every step overwrote half the velocities the projection had just
+made divergence-free. The test is now "did the projection solve for this face",
+i.e. is either adjacent cell water.
+
+**The domain box rendered as a solid.** Outside the grid, `fluidDistance` first
+returned the distance to the domain box — "walk there and ask again". That value
+falls to zero at the box, a sphere tracer reads zero as *surface here*, and the
+invisible walls of the tank rendered as a giant object filling the frame. A step
+instruction and a surface are the same number to a marcher. The bound has to
+stay positive wherever there is no water, and two facts give one that does:
+with `W` the water, `B` the box and `c = clamp(p, B)`, `|p−W| ≥ |p−B|` because
+the water is inside the box, and `|p−W| ≥ phi(c) − |p−c|` by the triangle
+inequality. The larger of the two is still a lower bound and behaves: far away
+the first term takes big steps, and at the wall the second becomes `phi` at the
+wall itself — positive unless the water really is touching there, in which case
+the bound collapses to zero and the wall shows a flat face of water, which is
+what a tank looks like.
+
+## The trust band
+
+`fluidDistance` saturates the sampled level set at a **trust band** (default 8
+cells). Redistancing runs a fixed handful of iterations per step, so the field is
+a faithful distance near the surface and progressively less faithful away from
+it; stepping by an unverified large value is exactly how a marcher tunnels
+through a surface. Capping the far field costs a few extra steps to cross an
+empty tank and cannot skip the water.
+
+A saturated distance is safe to *step* by — it under-reports, never over-reports
+— but it is not safe to *shade* by: a penumbra estimator reading a capped value
+far from any water concludes there is a surface just out of frame and dims the
+light. So both shadow marchers ask `fluidBand()` and drop the water term once
+the reading is at the cap.
+
+## Rendering, in both paths
+
+The reference renderer marches `worldSdf` everywhere — primary ray, shadow ray,
+reflection ray — so it is the reference for the water exactly as it is for the
+scene.
+
+The brick renderer takes the water at every DDA step as `min(brickDistance,
+fluidDistance)`, in all three of its march loops. The fluid is deliberately
+**not** baked into the brick structure: bricks describe a field that changes when
+the editor changes it, the water changes every frame, and re-baking a 64³ grid
+per frame to save one field lookup would be a poor trade. An empty top-level cell
+is empty of *baked* surface only, so its Lipschitz leap is clamped by the water
+distance — otherwise the leap would cross the surface.
+
+One constraint follows from that and is not enforced: the fluid domain must lie
+inside the brick AABB for the brick renderer to see the water at all, because
+its DDA never starts outside that box. The reference renderer has no such limit.
+
+Water takes its normal from the level set at half-cell spacing rather than from
+the combined field at 0.5 mm. The sampled field is only C0 across cell
+boundaries, so a hair-fine central difference resolves the faceting rather than
+the surface.
+
+## Diagnostics: the numbers, not the impression
+
+A liquid solver has several places where "looks about right" and "is right" come
+apart. A pressure solve that stopped short still looks like water. A level set
+quietly losing volume still looks like water. So `fluid_stats.comp` measures,
+once per frame, and the Fluid panel shows:
+
+- **Volume**, with a smeared Heaviside so the figure moves smoothly, and the
+  **drift** against the volume right after the last seed.
+- **Residual divergence** after the last projection — what the sweep count
+  actually achieved, quoted as a fraction of the fastest velocity in the field.
+- **Max speed**, which is where an about-to-be-unstable run says so first.
+
+Integer atomics in fixed point, because the RHI has no reduction primitive and
+adding one would put a synchronisation model in the seam. The readback blocks on
+the submitted frame exactly as the brick bake's does, so it runs on an interval
+rather than every frame.
+
+This is the same argument as reference-vs-brick: a claim with a number behind it
+rather than an assertion.
+
+## What it costs, and what it is not
+
+Grid-only advection of a level set **loses volume** — a few percent over a
+couple of seconds at the defaults, more if the timestep or the resolution is
+asked for too much. That is inherent to the method and not a bug to be tuned
+away. The fix is particles (FLIP/PIC) carrying the velocity and the surface, and
+this grid is exactly the substrate they would sit on. Until then the drift is
+reported rather than hidden, and a `Surface offset` knob exists that moves the
+picture without pretending to move the simulation.
+
+Also not here: no viscosity, no surface tension, no two-phase air, no adaptive
+or hierarchical grid, no fractional face areas at obstacles, no vorticity
+confinement, no multigrid or preconditioned CG, no resampling of the level set
+when the resolution changes (it re-seeds instead), no moving-obstacle velocity
+coupling — an animated primitive moves the walls the water sees, but transfers
+no momentum to it.
+
+## Determinism
+
+A pinned run (`--dump` / `--compare`) spends a fixed substep budget per frame
+instead of following the wall clock, so the water's state is a function of the
+frame index alone — the same reasoning as the pinned animation clock and the
+frozen camera.
+
+Agreement between paths is weaker here than elsewhere in the project, and
+honestly so. Both comparisons below are `scenes/dambreak.json` at frame 100,
+against a 1/255 per-component tolerance:
+
+| Comparison | Components outside tolerance | Mean | Median |
+|---|---|---|---|
+| dry scene, Vulkan vs OpenGL, reference | 0% (max one ULP) | 0.000000 | 0 |
+| dam break, Vulkan vs OpenGL, reference | 4.2% | 0.0017 | 0 |
+| dam break, reference vs brick, Vulkan | 10.2% | 0.0047 | 0 |
+
+Neither wet figure is a defect, and the difference image says why: half the
+frame is bit-identical, and every component that differs is on the churning
+surface, in the refracted view of a submerged object, or in the thin band where
+the wave meets the tank wall.
+
+Two separate effects, worth keeping apart:
+
+- **Backend vs backend.** The two round differently, a liquid is chaotic, and
+  200-plus substeps is plenty of amplification. This is a property of the system
+  being simulated, not of the seam — and it is why the strict max test, which is
+  the right one for a dry cross-backend run, is the wrong one here.
+- **Reference vs brick.** The pre-existing, documented brick divergence is
+  trilinear filter error at curved silhouettes. Water is a lens: refraction takes
+  that small difference in the *scene* field and bends a ray by it, so what is a
+  hairline at a silhouette becomes a visible offset in the refracted image behind
+  it. The A/B is still meaningful, but its budget has to be an order of magnitude
+  looser than the dry one — around `--max-outlier-fraction 0.12` — and the mean,
+  not the outlier count, is what says the two paths still agree.
+
+## Scene files
+
+A scene file carries the water: domain, solver settings, seed shape and
+appearance, under a `fluid` key (schema v4). Without it a dam-break file would
+restore the tank's obstacles and not the tank. A file with no `fluid` block
+leaves the running settings alone, so an older scene loaded into a live editor
+does not silently reset the water. `scenes/dambreak.json` is the worked example:
+a column of water behind an invisible dam, a shallow pool, and four obstacles
+for it to break over.
+
+---
+
 # The editor
 
 A panel to change the scene at runtime — select a primitive, edit its numbers,
@@ -746,8 +1023,12 @@ fitzel --backend opengl --frames 30 --compare probe.fzld
 ```
 
 0.000488 is one ULP of `RGBA16F` in that range. The strict max test is right for
-the cross-backend comparison, where the same shader must agree to a ULP; the
-outlier-fraction form is what the reference-vs-brick A/B needs, where a small,
+the cross-backend comparison **of a dry scene**, where the same shader must
+agree to a ULP; it is not the right test once water is in the frame, where
+hundreds of chaotic substeps amplify a rounding difference into a visibly
+different wave (see the fluid chapter's determinism section) — use
+`--max-outlier-fraction` there. The strict form is also right for the
+outlier-fraction form is what the reference-vs-brick A/B needs, a small,
 structural set of components legitimately differs (see the brick renderer's
 tolerance section). This is the intended foundation for golden-image tests —
 with the caveat recorded under leak #7: it reads the storage image, not the
@@ -859,7 +1140,11 @@ startup and `--save-scene` writes one and exits.
 
 Reference-vs-brick agrees within the documented outlier tolerance
 (`--max-outlier-fraction`); the brick image is bit-identical across the two
-backends, and a saved scene reloads bit-identically. Debug builds produce **zero
+backends, and a saved scene reloads bit-identically. The fluid is switched on by
+`--fluid` or by a scene file that carries a `fluid` block; with it off, the
+reference image is bit-identical to what it was before the solver existed
+(`max 0.000000`), which is the regression test that the water cost the dry path
+nothing. Debug builds produce **zero
 Vulkan validation messages and zero GL debug messages** across the bake, both
 render paths and the overlay.
 
