@@ -2,7 +2,8 @@ set(FITZEL_SHADER_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/raymarch.comp"
     "${CMAKE_CURRENT_SOURCE_DIR}/raymarch_brick.comp"
     "${CMAKE_CURRENT_SOURCE_DIR}/bake_classify.comp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/bake_fill.comp")
+    "${CMAKE_CURRENT_SOURCE_DIR}/bake_fill.comp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/pick.comp")
 
 # Shared #include files: the scene evaluation, the shading model and the brick
 # structure. They are not compiled on their own — they carry no entry point —

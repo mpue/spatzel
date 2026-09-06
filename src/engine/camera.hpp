@@ -12,6 +12,11 @@ class FlyCamera {
 public:
     void update(const platform::InputState& input, float deltaSeconds);
 
+    // Drive the camera from an animation sample: place it and aim it along
+    // `forward` (yaw/pitch derived, no roll), with the given vertical fov. Used by
+    // camera keyframe playback; free-fly input is suppressed while it runs.
+    void setPose(Vec3 position, Vec3 forward, float fovRadians);
+
     [[nodiscard]] Vec3  position() const { return m_position; }
     [[nodiscard]] Vec3  forward() const;
     [[nodiscard]] Vec3  right() const;

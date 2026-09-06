@@ -1,80 +1,29 @@
 #include "engine/editor.hpp"
 
-#include "engine/scene_io.hpp"
+#include "engine/editor_internal.hpp"
 
 #include <imgui.h>
+#include <imgui_internal.h> // DockBuilder*
 
 #include <algorithm>
-#include <array>
-#include <cfloat>
-#include <cmath>
-#include <cstdio>
-#include <exception>
-#include <system_error>
 
 namespace engine {
-namespace {
 
-constexpr std::array<const char*, 5> kTypeNames{"Sphere", "Box", "Torus", "Plane", "Round Cone"};
-constexpr std::array<const char*, 4> kOperatorNames{"Union", "SmoothUnion", "Subtract",
-                                                    "Intersect"};
+// The panel windows (buildRendererPanel/…), the viewport gizmo (buildGizmo,
+// drawSelectionOutlines), the lighting and vegetation windows live in the sibling
+// editor_*.cpp files; this file is the core: selection, undo, and the draw()
+// orchestration that hosts everything in a dockspace.
 
-constexpr size_t kMaxUndo = 128;
-
-const char* typeLabel(int32_t type) {
-    return (type >= 0 && type < static_cast<int32_t>(kTypeNames.size()))
-               ? kTypeNames[static_cast<size_t>(type)]
-               : "?";
-}
-
-GpuPrimitive makeDefault(PrimitiveType type) {
-    GpuPrimitive p{};              // rotation defaults to identity, albedo to grey
-    p.position[1] = 1.0f;          // lifted off the ground so it is visible
-    p.albedo[0]   = 0.80f;
-    p.albedo[1]   = 0.70f;
-    p.albedo[2]   = 0.45f;
-    p.control[0]  = static_cast<int32_t>(type);
-    p.control[1]  = static_cast<int32_t>(Operator::Union);
-    switch (type) {
-        case PrimitiveType::Sphere:
-            p.params[0] = 0.5f;
-            break;
-        case PrimitiveType::Box:
-            p.params[0] = p.params[1] = p.params[2] = 0.5f;
-            p.params[3] = 0.05f;
-            break;
-        case PrimitiveType::Torus:
-            p.params[0] = 0.6f;
-            p.params[1] = 0.2f;
-            break;
-        case PrimitiveType::Plane:
-            p.position[1] = 0.0f;
-            p.params[1]   = 1.0f; // unit normal pointing up
-            break;
-        case PrimitiveType::RoundCone:
-            p.params[0] = 1.0f;  // height
-            p.params[1] = 0.15f; // base radius
-            p.params[2] = 0.08f; // tip radius
-            break;
+Editor::Snapshot Editor::snapshot(const std::vector<GpuPrimitive>& scene) const {
+    Snapshot s;
+    s.scene = scene;
+    if (m_anim != nullptr) {
+        s.anim = *m_anim;
     }
-    return p;
+    return s;
 }
 
-void normaliseQuat(float q[4]) {
-    const float len = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
-    if (len > 1e-6f) {
-        for (int i = 0; i < 4; ++i) {
-            q[i] /= len;
-        }
-    } else {
-        q[0] = q[1] = q[2] = 0.0f;
-        q[3] = 1.0f;
-    }
-}
-
-} // namespace
-
-void Editor::pushUndo(std::vector<GpuPrimitive> state) {
+void Editor::pushUndo(Snapshot state) {
     m_undo.push_back(std::move(state));
     if (m_undo.size() > kMaxUndo) {
         m_undo.erase(m_undo.begin());
@@ -82,456 +31,172 @@ void Editor::pushUndo(std::vector<GpuPrimitive> state) {
     m_redo.clear();
 }
 
-void Editor::clampSelection(const std::vector<GpuPrimitive>& scene) {
-    if (scene.empty()) {
-        m_selected = -1;
-    } else {
-        m_selected = std::clamp(m_selected, 0, static_cast<int>(scene.size()) - 1);
+// Undo and redo are the same move in opposite directions, so both go through
+// here: the live state is pushed onto the other stack before it is overwritten.
+void Editor::restore(std::vector<Snapshot>& from, std::vector<Snapshot>& to,
+                     std::vector<GpuPrimitive>& scene, EditorActions& actions) {
+    if (from.empty()) {
+        return;
     }
+    to.push_back(snapshot(scene));
+    Snapshot state = std::move(from.back());
+    from.pop_back();
+    scene = std::move(state.scene);
+    if (m_anim != nullptr) {
+        *m_anim = std::move(state.anim);
+    }
+    clampSelection(scene);
+    m_tlSelTime          = -1.0f; // the keyframe it pointed at may be gone
+    actions.sceneChanged = actions.bakeMeasure = true;
+}
+
+void Editor::applyUndo(std::vector<GpuPrimitive>& scene, EditorActions& actions) {
+    restore(m_undo, m_redo, scene, actions);
+}
+
+void Editor::applyRedo(std::vector<GpuPrimitive>& scene, EditorActions& actions) {
+    restore(m_redo, m_undo, scene, actions);
+}
+
+void Editor::handleUndoShortcuts(std::vector<GpuPrimitive>& scene, EditorActions& actions) {
+    const ImGuiIO& io = ImGui::GetIO();
+    // Not while typing (Ctrl+Z belongs to the text field then), and not mid-drag:
+    // a gizmo or keyframe drag is still assembling its own single undo entry.
+    if (io.WantTextInput || m_gizmoUsing || m_tlDrag != 0 || !io.KeyCtrl) {
+        return;
+    }
+    const bool z = ImGui::IsKeyPressed(ImGuiKey_Z, false);
+    if (z && !io.KeyShift) {
+        applyUndo(scene, actions);
+    } else if (ImGui::IsKeyPressed(ImGuiKey_Y, false) || (z && io.KeyShift)) {
+        applyRedo(scene, actions);
+    }
+}
+
+void Editor::clampSelection(const std::vector<GpuPrimitive>& scene) {
+    // Drop any selected index that ran past the end of a shrunken scene; the rest
+    // (including an empty selection) is left as-is.
+    const int count = static_cast<int>(scene.size());
+    m_selection.erase(std::remove_if(m_selection.begin(), m_selection.end(),
+                                     [count](int i) { return i < 0 || i >= count; }),
+                      m_selection.end());
+}
+
+bool Editor::isSelected(int index) const {
+    return std::find(m_selection.begin(), m_selection.end(), index) != m_selection.end();
+}
+
+void Editor::selectOnly(int index) {
+    m_selection.assign(1, index);
+}
+
+void Editor::toggleSelected(int index) {
+    const auto it = std::find(m_selection.begin(), m_selection.end(), index);
+    if (it != m_selection.end()) {
+        m_selection.erase(it);
+    } else {
+        m_selection.push_back(index); // becomes the new primary
+    }
+}
+
+void Editor::applyPick(int index) {
+    if (index < 0) {
+        // Miss: a plain click clears the selection; a Ctrl-click leaves it be (so
+        // a stray click while building a multi-selection does not wipe it).
+        if (!m_pendingPickAdditive) {
+            m_selection.clear();
+        }
+        return;
+    }
+    if (m_pendingPickAdditive) {
+        toggleSelected(index);
+    } else {
+        selectOnly(index);
+    }
+}
+
+// The default docking layout, built once when no saved layout exists: a left
+// column (Primitives over Properties), a right column (Renderer, Lighting, then
+// Vegetation+Scene tabbed), and the viewport in the transparent centre.
+void Editor::setupDockLayout(unsigned int dockId) {
+    ImGui::DockBuilderRemoveNode(dockId);
+    ImGui::DockBuilderAddNode(dockId, ImGuiDockNodeFlags_DockSpace |
+                                          ImGuiDockNodeFlags_PassthruCentralNode);
+    ImGui::DockBuilderSetNodeSize(dockId, ImGui::GetMainViewport()->Size);
+
+    ImGuiID centre = dockId;
+
+    // A full-width strip across the very bottom for the Timeline (split first so
+    // it spans the whole width, Blender-style), then the left/right columns above.
+    const ImGuiID bottom = ImGui::DockBuilderSplitNode(centre, ImGuiDir_Down, 0.26f, nullptr,
+                                                       &centre);
+    const ImGuiID left   = ImGui::DockBuilderSplitNode(centre, ImGuiDir_Left, 0.22f, nullptr,
+                                                       &centre);
+    const ImGuiID right  = ImGui::DockBuilderSplitNode(centre, ImGuiDir_Right, 0.30f, nullptr,
+                                                       &centre);
+
+    ImGuiID       leftBottom = 0;
+    const ImGuiID leftTop = ImGui::DockBuilderSplitNode(left, ImGuiDir_Up, 0.45f, nullptr,
+                                                        &leftBottom);
+
+    ImGuiID       rightRest = 0;
+    const ImGuiID rightTop  = ImGui::DockBuilderSplitNode(right, ImGuiDir_Up, 0.32f, nullptr,
+                                                          &rightRest);
+    ImGuiID       rightBottom = 0;
+    const ImGuiID rightMid = ImGui::DockBuilderSplitNode(rightRest, ImGuiDir_Up, 0.55f, nullptr,
+                                                         &rightBottom);
+
+    ImGui::DockBuilderDockWindow("Primitives", leftTop);
+    ImGui::DockBuilderDockWindow("Properties", leftBottom);
+    ImGui::DockBuilderDockWindow("Renderer", rightTop);
+    ImGui::DockBuilderDockWindow("Lighting", rightMid);
+    ImGui::DockBuilderDockWindow("Vegetation", rightBottom);
+    ImGui::DockBuilderDockWindow("Scene", rightBottom); // tabbed with Vegetation
+    ImGui::DockBuilderDockWindow("Timeline", bottom);
+    ImGui::DockBuilderFinish(dockId);
 }
 
 EditorActions Editor::draw(std::vector<GpuPrimitive>& scene, RendererMode& renderer,
-                           RenderSettings& render, bool brickAvailable, const EditorStats& stats,
+                           RenderSettings& render, LightingSettings& lighting, AnimationClip& anim,
+                           AnimationState& animState, const ViewportCamera& camera,
+                           bool brickAvailable, const EditorStats& stats,
                            const std::filesystem::path& sceneDir) {
     EditorActions actions;
+    m_anim = &anim; // what a snapshot taken inside a panel captures beside the scene
     clampSelection(scene);
 
-    // Marks a live value change this frame, and — separately — a committed edit
-    // (a finished drag or a typed-and-confirmed value), which is what an undo
-    // entry and a timed re-bake key off. Snapshots the pre-edit scene when a
-    // field is first touched so one edit session is one undo entry.
-    auto track = [&]() {
-        if (ImGui::IsItemActivated()) {
-            m_preEdit = scene;
-        }
-        if (ImGui::IsItemEdited()) {
-            actions.sceneChanged = true;
-        }
-        if (ImGui::IsItemDeactivatedAfterEdit()) {
-            pushUndo(m_preEdit);
-            actions.bakeMeasure = true;
-        }
-    };
+    // The viewport gizmo and click-picking run first (into the background draw
+    // list, over the image), so the gizmo owns the mouse when hovered and a click
+    // on empty space falls through to a pick.
+    buildGizmo(scene, camera, actions);
 
-    ImGui::SetNextWindowSize(ImVec2(340, 640), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowPos(ImVec2(16, 16), ImGuiCond_FirstUseEver);
-    ImGui::Begin("Scene Editor");
+    // Ctrl+Z / Ctrl+Y anywhere in the editor. After the gizmo, so a drag ending
+    // this frame has already committed its own entry, and before the panels, so
+    // they build their widgets from the restored state.
+    handleUndoShortcuts(scene, actions);
 
-    // --- status / info -----------------------------------------------------
-    ImGui::Text("%.1f FPS  (%.2f ms)", static_cast<double>(stats.fps),
-                static_cast<double>(stats.frametimeMs));
-    ImGui::Text("Renderer: %s", stats.rendererName);
-    if (brickAvailable) {
-        const bool brick = renderer == RendererMode::Brick;
-        ImGui::BeginDisabled(brick);
-        if (ImGui::Button("Brick")) {
-            renderer = RendererMode::Brick;
-        }
-        ImGui::EndDisabled();
-        ImGui::SameLine();
-        ImGui::BeginDisabled(!brick);
-        if (ImGui::Button("Reference")) {
-            renderer = RendererMode::Reference;
-        }
-        ImGui::EndDisabled();
-        if (stats.haveBake) {
-            ImGui::Text("Last re-bake: %.1f ms", static_cast<double>(stats.lastBakeMs));
-        } else {
-            ImGui::TextDisabled("Last re-bake: -");
+    // Dock host over the whole viewport; the central node is transparent so the
+    // 3D image shows through and clicks there reach the picker.
+    const ImGuiID dockId = ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport(),
+                                                        ImGuiDockNodeFlags_PassthruCentralNode);
+    if (!m_dockInit) {
+        m_dockInit                = true;
+        const ImGuiDockNode* node = ImGui::DockBuilderGetNode(dockId);
+        // Build the default layout only when the ini restored nothing.
+        if (node == nullptr || node->IsEmpty()) {
+            setupDockLayout(dockId);
         }
     }
-    ImGui::Text("Primitives: %d / %d", stats.primitiveCount, stats.maxPrimitives);
 
-    ImGui::Separator();
-
-    // --- render settings ---------------------------------------------------
-    // Exposure and reflection-sample count feed the marcher uniforms directly;
-    // no re-upload or re-bake, so they need no track()/action flag.
-    ImGui::SliderFloat("Exposure", &render.exposure, 0.1f, 8.0f, "%.2f",
-                       ImGuiSliderFlags_Logarithmic);
-    ImGui::SliderInt("Reflection samples", &render.reflectionSamples, 1, 32);
-
-    ImGui::Separator();
-
-    // --- undo / redo -------------------------------------------------------
-    ImGui::BeginDisabled(m_undo.empty());
-    if (ImGui::Button("Undo")) {
-        m_redo.push_back(scene);
-        scene = std::move(m_undo.back());
-        m_undo.pop_back();
-        clampSelection(scene);
-        actions.sceneChanged = actions.bakeMeasure = true;
-    }
-    ImGui::EndDisabled();
-    ImGui::SameLine();
-    ImGui::BeginDisabled(m_redo.empty());
-    if (ImGui::Button("Redo")) {
-        m_undo.push_back(scene);
-        scene = std::move(m_redo.back());
-        m_redo.pop_back();
-        clampSelection(scene);
-        actions.sceneChanged = actions.bakeMeasure = true;
-    }
-    ImGui::EndDisabled();
-
-    ImGui::Separator();
-
-    // --- primitive list ----------------------------------------------------
-    ImGui::TextUnformatted("Primitives");
-    if (ImGui::BeginListBox("##primitives", ImVec2(-FLT_MIN, 140))) {
-        for (int i = 0; i < static_cast<int>(scene.size()); ++i) {
-            char label[64];
-            std::snprintf(label, sizeof(label), "%d: %s##%d", i,
-                          typeLabel(scene[static_cast<size_t>(i)].control[0]), i);
-            if (ImGui::Selectable(label, m_selected == i)) {
-                m_selected = i;
-            }
-        }
-        ImGui::EndListBox();
-    }
-
-    // --- add / delete ------------------------------------------------------
-    ImGui::SetNextItemWidth(140);
-    ImGui::Combo("##addtype", &m_addType, kTypeNames.data(),
-                 static_cast<int>(kTypeNames.size()));
-    ImGui::SameLine();
-    ImGui::BeginDisabled(stats.primitiveCount >= stats.maxPrimitives);
-    if (ImGui::Button("Add")) {
-        pushUndo(scene);
-        scene.push_back(makeDefault(static_cast<PrimitiveType>(m_addType)));
-        m_selected           = static_cast<int>(scene.size()) - 1;
-        actions.sceneChanged = actions.bakeMeasure = true;
-    }
-    ImGui::EndDisabled();
-    ImGui::SameLine();
-    ImGui::BeginDisabled(m_selected < 0);
-    if (ImGui::Button("Delete")) {
-        pushUndo(scene);
-        scene.erase(scene.begin() + m_selected);
-        clampSelection(scene);
-        actions.sceneChanged = actions.bakeMeasure = true;
-    }
-    ImGui::EndDisabled();
-
-    ImGui::Separator();
-
-    // --- selected primitive ------------------------------------------------
-    if (m_selected >= 0 && m_selected < static_cast<int>(scene.size())) {
-        GpuPrimitive& p = scene[static_cast<size_t>(m_selected)];
-
-        // Type. Changing it resets the parameters to that type's defaults,
-        // since the params mean different things per type.
-        int type = p.control[0];
-        if (ImGui::Combo("Type", &type, kTypeNames.data(), static_cast<int>(kTypeNames.size())) &&
-            type != p.control[0]) {
-            pushUndo(scene);
-            GpuPrimitive fresh = makeDefault(static_cast<PrimitiveType>(type));
-            // Keep placement and material; reset only the type-specific params.
-            std::copy(std::begin(p.position), std::end(p.position), std::begin(fresh.position));
-            std::copy(std::begin(p.rotation), std::end(p.rotation), std::begin(fresh.rotation));
-            std::copy(std::begin(p.albedo), std::end(p.albedo), std::begin(fresh.albedo));
-            std::copy(std::begin(p.material), std::end(p.material), std::begin(fresh.material));
-            fresh.control[1] = p.control[1];
-            p                = fresh;
-            actions.sceneChanged = actions.bakeMeasure = true;
-        }
-
-        int op = p.control[1];
-        if (ImGui::Combo("Operator", &op, kOperatorNames.data(),
-                         static_cast<int>(kOperatorNames.size())) &&
-            op != p.control[1]) {
-            pushUndo(scene);
-            p.control[1]         = op;
-            actions.sceneChanged = actions.bakeMeasure = true;
-        }
-
-        ImGui::DragFloat3("Position", p.position, 0.01f);
-        track();
-
-        ImGui::DragFloat4("Rotation", p.rotation, 0.01f);
-        normaliseQuat(p.rotation); // the shader assumes a unit quaternion
-        track();
-
-        if (p.control[1] == static_cast<int32_t>(Operator::SmoothUnion)) {
-            ImGui::DragFloat("Blend", &p.position[3], 0.005f, 0.0f, 4.0f);
-            track();
-        }
-
-        // Type-specific parameters.
-        switch (static_cast<PrimitiveType>(p.control[0])) {
-            case PrimitiveType::Sphere:
-                ImGui::DragFloat("Radius", &p.params[0], 0.01f, 0.0f, 100.0f);
-                track();
-                break;
-            case PrimitiveType::Box:
-                ImGui::DragFloat3("Half extents", p.params, 0.01f, 0.0f, 100.0f);
-                track();
-                ImGui::DragFloat("Rounding", &p.params[3], 0.005f, 0.0f, 100.0f);
-                track();
-                break;
-            case PrimitiveType::Torus:
-                ImGui::DragFloat("Major radius", &p.params[0], 0.01f, 0.0f, 100.0f);
-                track();
-                ImGui::DragFloat("Minor radius", &p.params[1], 0.01f, 0.0f, 100.0f);
-                track();
-                break;
-            case PrimitiveType::Plane:
-                ImGui::DragFloat3("Normal", p.params, 0.01f);
-                track();
-                ImGui::DragFloat("Offset", &p.params[3], 0.01f);
-                track();
-                break;
-            case PrimitiveType::RoundCone:
-                ImGui::DragFloat("Height", &p.params[0], 0.01f, 0.0f, 100.0f);
-                track();
-                ImGui::DragFloat("Base radius", &p.params[1], 0.005f, 0.0f, 100.0f);
-                track();
-                ImGui::DragFloat("Tip radius", &p.params[2], 0.005f, 0.0f, 100.0f);
-                track();
-                break;
-        }
-
-        ImGui::ColorEdit3("Albedo", p.albedo);
-        track();
-
-        // Metallic-roughness PBR material.
-        ImGui::SliderFloat("Roughness", &p.material[0], 0.0f, 1.0f);
-        track();
-        ImGui::SliderFloat("Metallic", &p.material[1], 0.0f, 1.0f);
-        track();
-        ImGui::DragFloat("Emissive", &p.material[2], 0.02f, 0.0f, 20.0f);
-        track();
-    } else {
-        ImGui::TextDisabled("No primitive selected");
-    }
-
-    ImGui::Separator();
-
-    // --- vegetation generator ---------------------------------------------
+    buildRendererPanel(renderer, render, brickAvailable, stats, actions);
+    buildPrimitivesPanel(scene, stats, actions);
+    buildPropertiesPanel(scene, actions);
+    buildLightingPanel(lighting, actions);
     buildLSystemPanel(scene, stats, actions);
+    buildTimelinePanel(scene, anim, animState, camera);
+    buildScenePanel(scene, anim, actions, sceneDir);
 
-    ImGui::Separator();
-
-    // --- save / load -------------------------------------------------------
-    ImGui::TextUnformatted("Scene file");
-    ImGui::InputText("##filename", m_fileName, sizeof(m_fileName));
-
-    const auto resolve = [&](const char* name) {
-        std::filesystem::path p(name);
-        return p.is_absolute() ? p : sceneDir / p;
-    };
-
-    ImGui::SameLine();
-    if (ImGui::Button("Save")) {
-        try {
-            saveScene(resolve(m_fileName), scene);
-            m_status = std::string("Saved ") + m_fileName;
-        } catch (const std::exception& e) {
-            m_status = std::string("Save failed: ") + e.what();
-        }
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Load")) {
-        try {
-            std::vector<GpuPrimitive> loaded = loadScene(resolve(m_fileName));
-            pushUndo(scene);
-            scene = std::move(loaded);
-            clampSelection(scene);
-            actions.sceneChanged = actions.bakeMeasure = true;
-            m_status = std::string("Loaded ") + m_fileName;
-        } catch (const std::exception& e) {
-            m_status = std::string("Load failed: ") + e.what();
-        }
-    }
-
-    // Example scenes: every .json beside the executable's scenes/ directory,
-    // one click to load. This is where the committed sample scenes surface.
-    if (ImGui::TreeNode("Examples")) {
-        std::error_code ec;
-        std::filesystem::directory_iterator it(sceneDir, ec);
-        if (ec) {
-            ImGui::TextDisabled("(%s)", sceneDir.string().c_str());
-        } else {
-            for (const auto& entry : it) {
-                if (entry.path().extension() != ".json") {
-                    continue;
-                }
-                const std::string name = entry.path().filename().string();
-                if (ImGui::Button(name.c_str())) {
-                    try {
-                        std::vector<GpuPrimitive> loaded = loadScene(entry.path());
-                        pushUndo(scene);
-                        scene = std::move(loaded);
-                        clampSelection(scene);
-                        actions.sceneChanged = actions.bakeMeasure = true;
-                        std::snprintf(m_fileName, sizeof(m_fileName), "%s", name.c_str());
-                        m_status = "Loaded " + name;
-                    } catch (const std::exception& e) {
-                        m_status = std::string("Load failed: ") + e.what();
-                    }
-                }
-            }
-        }
-        ImGui::TreePop();
-    }
-
-    if (!m_status.empty()) {
-        ImGui::TextWrapped("%s", m_status.c_str());
-    }
-
-    ImGui::End();
     return actions;
-}
-
-LSystemConfig Editor::lsysConfig() const {
-    LSystemConfig c;
-    c.axiom = m_lsys.axiom;
-    for (int i = 0; i < kLsysMaxRules; ++i) {
-        if (m_lsys.rulePred[i][0] != '\0' && m_lsys.ruleSucc[i][0] != '\0') {
-            c.rules.push_back(LRule{m_lsys.rulePred[i][0], m_lsys.ruleSucc[i]});
-        }
-    }
-    c.iterations    = m_lsys.iterations;
-    c.angleDeg      = m_lsys.angleDeg;
-    c.segmentLength = m_lsys.segmentLength;
-    c.lengthTaper   = m_lsys.lengthTaper;
-    c.baseRadius    = m_lsys.baseRadius;
-    c.radiusTaper   = m_lsys.radiusTaper;
-    c.leafSize      = m_lsys.leafSize;
-    c.leaves        = m_lsys.leaves;
-    c.tropism       = m_lsys.tropism;
-    c.seed          = static_cast<std::uint32_t>(m_lsys.seed);
-    c.jitter        = m_lsys.jitter;
-    c.basePosition  = {m_lsys.basePos[0], m_lsys.basePos[1], m_lsys.basePos[2]};
-    c.branchColour  = {m_lsys.branchColour[0], m_lsys.branchColour[1], m_lsys.branchColour[2]};
-    c.leafColour    = {m_lsys.leafColour[0], m_lsys.leafColour[1], m_lsys.leafColour[2]};
-    return c;
-}
-
-void Editor::buildLSystemPanel(std::vector<GpuPrimitive>& scene, const EditorStats& stats,
-                               EditorActions& actions) {
-    if (!ImGui::CollapsingHeader("Vegetation (L-System)")) {
-        return;
-    }
-
-    const auto clearRules = [&]() {
-        for (int i = 0; i < kLsysMaxRules; ++i) {
-            m_lsys.rulePred[i][0] = '\0';
-            m_lsys.ruleSucc[i][0] = '\0';
-        }
-    };
-    const auto setRule = [&](int i, const char* pred, const char* succ) {
-        std::snprintf(m_lsys.rulePred[i], sizeof(m_lsys.rulePred[i]), "%s", pred);
-        std::snprintf(m_lsys.ruleSucc[i], sizeof(m_lsys.ruleSucc[i]), "%s", succ);
-    };
-
-    // Presets seed the whole config; "Custom" leaves the fields as they are so a
-    // user can dial in their own grammar without a preset overwriting it.
-    static constexpr std::array<const char*, 4> kPresetNames{"Custom", "Plant", "Bush", "Tree (3D)"};
-    if (ImGui::Combo("Preset", &m_lsys.preset, kPresetNames.data(),
-                     static_cast<int>(kPresetNames.size()))) {
-        switch (m_lsys.preset) {
-            case 1: // Plant — the classic planar fractal plant, softened by jitter
-                std::snprintf(m_lsys.axiom, sizeof(m_lsys.axiom), "%s", "X");
-                clearRules();
-                setRule(0, "X", "F+[[X]-X]-F[-FX]+X");
-                setRule(1, "F", "FF");
-                m_lsys.iterations = 3;   m_lsys.angleDeg = 25.0f;
-                m_lsys.segmentLength = 0.28f; m_lsys.lengthTaper = 0.90f;
-                m_lsys.baseRadius = 0.06f; m_lsys.radiusTaper = 0.74f;
-                m_lsys.leafSize = 0.09f; m_lsys.leaves = true;
-                m_lsys.tropism = 0.04f;  m_lsys.jitter = 0.22f;
-                break;
-            case 2: // Bush — a rounder, denser plant. Grows ~8x per pass, so it
-                    // stays at 3 iterations to fit the primitive budget.
-                std::snprintf(m_lsys.axiom, sizeof(m_lsys.axiom), "%s", "F");
-                clearRules();
-                setRule(0, "F", "FF-[-F+F+F]+[+F-F-F]");
-                m_lsys.iterations = 3;   m_lsys.angleDeg = 22.0f;
-                m_lsys.segmentLength = 0.22f; m_lsys.lengthTaper = 0.88f;
-                m_lsys.baseRadius = 0.06f; m_lsys.radiusTaper = 0.78f;
-                m_lsys.leafSize = 0.11f; m_lsys.leaves = true;
-                m_lsys.tropism = 0.03f;  m_lsys.jitter = 0.30f;
-                break;
-            case 3: // Tree (3D) — pitched sub-branches rolled apart into 3D.
-                    // Leaves are placed automatically at the twig tips.
-                std::snprintf(m_lsys.axiom, sizeof(m_lsys.axiom), "%s", "A");
-                clearRules();
-                setRule(0, "A", "F[&FA]/////[&FA]///////[&FA]");
-                setRule(1, "F", "FF");
-                m_lsys.iterations = 4;   m_lsys.angleDeg = 26.0f;
-                m_lsys.segmentLength = 0.26f; m_lsys.lengthTaper = 0.90f;
-                m_lsys.baseRadius = 0.16f; m_lsys.radiusTaper = 0.72f;
-                m_lsys.leafSize = 0.16f; m_lsys.leaves = true;
-                m_lsys.tropism = 0.05f;  m_lsys.jitter = 0.24f;
-                break;
-            default:
-                break; // Custom
-        }
-    }
-
-    ImGui::InputText("Axiom", m_lsys.axiom, sizeof(m_lsys.axiom));
-    ImGui::TextDisabled("Rules (predecessor -> successor)");
-    for (int i = 0; i < kLsysMaxRules; ++i) {
-        ImGui::PushID(i);
-        ImGui::SetNextItemWidth(24.0f);
-        if (ImGui::InputText("##pred", m_lsys.rulePred[i], sizeof(m_lsys.rulePred[i]))) {
-            m_lsys.preset = 0;
-        }
-        ImGui::SameLine();
-        ImGui::TextUnformatted("->");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(-FLT_MIN);
-        if (ImGui::InputText("##succ", m_lsys.ruleSucc[i], sizeof(m_lsys.ruleSucc[i]))) {
-            m_lsys.preset = 0;
-        }
-        ImGui::PopID();
-    }
-
-    ImGui::SliderInt("Iterations", &m_lsys.iterations, 0, 8);
-    ImGui::SliderFloat("Angle", &m_lsys.angleDeg, 0.0f, 90.0f, "%.1f deg");
-    ImGui::DragFloat("Segment len", &m_lsys.segmentLength, 0.005f, 0.01f, 5.0f);
-    ImGui::SliderFloat("Length taper", &m_lsys.lengthTaper, 0.40f, 1.0f);
-    ImGui::DragFloat("Base radius", &m_lsys.baseRadius, 0.002f, 0.005f, 2.0f);
-    ImGui::SliderFloat("Radius taper", &m_lsys.radiusTaper, 0.50f, 1.0f);
-    ImGui::SliderFloat("Tropism", &m_lsys.tropism, -0.30f, 0.30f);
-    ImGui::Checkbox("Leaves", &m_lsys.leaves);
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(90.0f);
-    ImGui::DragFloat("Leaf size", &m_lsys.leafSize, 0.005f, 0.01f, 1.0f);
-    ImGui::DragInt("Seed", &m_lsys.seed, 0.1f, 0, 100000);
-    ImGui::SliderFloat("Jitter", &m_lsys.jitter, 0.0f, 1.0f);
-    ImGui::DragFloat3("Base pos", m_lsys.basePos, 0.02f);
-    ImGui::ColorEdit3("Branch col", m_lsys.branchColour);
-    ImGui::ColorEdit3("Leaf col", m_lsys.leafColour);
-
-    // Live estimate: expand the grammar (string-only, cheap) and count the draw
-    // symbols, so the primitive cost is visible before committing to Generate.
-    const LSystemConfig cfg      = lsysConfig();
-    const std::string   expanded = lsystemExpand(cfg);
-    const int           estimate = lsystemPrimitiveCount(expanded, cfg);
-    const int           freeSlots = stats.maxPrimitives - stats.primitiveCount;
-    const bool          overflow = estimate > freeSlots;
-
-    if (overflow) {
-        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f),
-                           "~ %d primitives (only %d free)", estimate, freeSlots);
-    } else {
-        ImGui::Text("~ %d primitives (%d free)", estimate, freeSlots);
-    }
-
-    // Same capacity guard the Add button uses — never let a bulk insert be
-    // silently truncated by uploadScene.
-    ImGui::BeginDisabled(overflow || estimate == 0);
-    if (ImGui::Button("Generate")) {
-        pushUndo(scene);
-        const std::vector<GpuPrimitive> plant = lsystemBuild(expanded, cfg);
-        scene.insert(scene.end(), plant.begin(), plant.end());
-        clampSelection(scene);
-        actions.sceneChanged = actions.bakeMeasure = true;
-        m_status = "Generated " + std::to_string(plant.size()) + " primitives";
-    }
-    ImGui::EndDisabled();
 }
 
 } // namespace engine

@@ -17,8 +17,8 @@ using nlohmann::json;
 // form is that a person can read and hand-edit it. The mapping is the file
 // format's contract, so it is spelled out here rather than derived from the
 // enum's numeric value.
-constexpr std::array<std::string_view, 5> kTypeNames{"Sphere", "Box", "Torus", "Plane",
-                                                     "RoundCone"};
+constexpr std::array<std::string_view, 6> kTypeNames{"Sphere",    "Box",     "Torus",
+                                                     "Plane",     "RoundCone", "Cylinder"};
 constexpr std::array<std::string_view, 4> kOperatorNames{"Union", "SmoothUnion", "Subtract",
                                                          "Intersect"};
 
@@ -72,12 +72,14 @@ std::array<float, N> readFloats(const json& node, const char* key) {
 
 } // namespace
 
-void saveScene(const std::filesystem::path& path, const std::vector<GpuPrimitive>& scene) {
+void saveScene(const std::filesystem::path& path, const std::vector<GpuPrimitive>& scene,
+               const AnimationClip* anim) {
     json primitives = json::array();
     for (const GpuPrimitive& p : scene) {
         primitives.push_back(json{
             {"type", typeName(p.control[0])},
             {"operator", operatorName(p.control[1])},
+            {"id", objectIdOf(p)}, // stable animation object id (0 = none)
             {"position", {p.position[0], p.position[1], p.position[2]}},
             {"rotation", {p.rotation[0], p.rotation[1], p.rotation[2], p.rotation[3]}},
             {"blend", p.position[3]},
@@ -86,9 +88,35 @@ void saveScene(const std::filesystem::path& path, const std::vector<GpuPrimitive
             {"roughness", p.material[0]},
             {"metallic", p.material[1]},
             {"emissive", p.material[2]},
+            {"transmission", p.material[3]},
         });
     }
-    const json document{{"version", 2}, {"primitives", std::move(primitives)}};
+    json document{{"version", 3}, {"primitives", std::move(primitives)}};
+
+    // Keyframe tracks, keyed by object id. Only non-empty tracks are written.
+    if (anim != nullptr) {
+        json tracks = json::array();
+        for (const ObjectTrack& tr : anim->tracks) {
+            if (tr.keys.empty()) {
+                continue;
+            }
+            json keys = json::array();
+            for (const PoseKey& k : tr.keys) {
+                keys.push_back(json{
+                    {"time", k.time},
+                    {"position", {k.position.x, k.position.y, k.position.z}},
+                    {"rotation", {k.rotation.x, k.rotation.y, k.rotation.z, k.rotation.w}},
+                    {"dims", {k.dims[0], k.dims[1], k.dims[2], k.dims[3]}},
+                });
+            }
+            tracks.push_back(json{{"objectId", tr.objectId}, {"keys", std::move(keys)}});
+        }
+        if (!tracks.empty()) {
+            document["animation"] = json{{"duration", anim->duration},
+                                         {"linear", anim->linear},
+                                         {"tracks", std::move(tracks)}};
+        }
+    }
 
     std::ofstream file(path, std::ios::trunc);
     if (!file) {
@@ -100,7 +128,7 @@ void saveScene(const std::filesystem::path& path, const std::vector<GpuPrimitive
     }
 }
 
-std::vector<GpuPrimitive> loadScene(const std::filesystem::path& path) {
+std::vector<GpuPrimitive> loadScene(const std::filesystem::path& path, AnimationClip* anim) {
     std::ifstream file(path);
     if (!file) {
         throw std::runtime_error("scene: cannot read " + path.string());
@@ -147,9 +175,41 @@ std::vector<GpuPrimitive> loadScene(const std::filesystem::path& path) {
         p.material[0] = node.value("roughness", p.material[0]);
         p.material[1] = node.value("metallic", p.material[1]);
         p.material[2] = node.value("emissive", p.material[2]);
+        p.material[3] = node.value("transmission", p.material[3]); // optional; 0 = opaque
         p.control[0]  = typeFromName(node.at("type").get<std::string>());
         p.control[1]  = operatorFromName(node.at("operator").get<std::string>());
+        p.control[2]  = static_cast<int32_t>(node.value("id", 0u)); // animation id (v3+)
         scene.push_back(p);
+    }
+
+    // Animation clip (schema v3+). Absent -> the caller keeps an empty clip.
+    if (anim != nullptr) {
+        anim->tracks.clear();
+        if (document.contains("animation")) {
+            const auto& a = document.at("animation");
+            anim->duration = a.value("duration", anim->duration);
+            anim->linear   = a.value("linear", anim->linear);
+            if (a.contains("tracks")) {
+                for (const json& tnode : a.at("tracks")) {
+                    ObjectTrack tr;
+                    tr.objectId = tnode.at("objectId").get<std::uint32_t>();
+                    for (const json& knode : tnode.at("keys")) {
+                        PoseKey    k;
+                        const auto pos = readFloats<3>(knode, "position");
+                        const auto rot = readFloats<4>(knode, "rotation");
+                        const auto dim = readFloats<4>(knode, "dims");
+                        k.time     = knode.at("time").get<float>();
+                        k.position = {pos[0], pos[1], pos[2]};
+                        k.rotation = {rot[0], rot[1], rot[2], rot[3]};
+                        for (int c = 0; c < 4; ++c) {
+                            k.dims[c] = dim[c];
+                        }
+                        tr.keys.push_back(k);
+                    }
+                    anim->tracks.push_back(std::move(tr));
+                }
+            }
+        }
     }
     return scene;
 }

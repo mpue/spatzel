@@ -1,0 +1,65 @@
+#version 450 core
+
+// Viewport picking. One invocation marches a single ray — the camera origin
+// through the clicked pixel — and writes the index of the primitive the eye sees
+// at the hit (or -1 on a miss) into a 1-int buffer the host reads back.
+//
+// It defines FITZEL_PICK before including the shared scene, which threads the
+// owning primitive through the CSG fold (see sdf_scene.glsl). The reference and
+// brick shaders never define it, so their fold compiles byte-identically — the
+// pick logic is dead weight only here, where it is wanted.
+
+#define FITZEL_PICK
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+#ifdef TARGET_VULKAN
+layout(push_constant) uniform Pick {
+    vec4  rayOrigin; // xyz
+    vec4  rayDir;    // xyz, normalised
+    ivec4 control;   // x = primitiveCount
+} u;
+#else
+layout(binding = 0, std140) uniform Pick {
+    vec4  rayOrigin;
+    vec4  rayDir;
+    ivec4 control;
+} u;
+#endif
+
+#include "sdf_scene.glsl" // scene edit list at slot 1; FITZEL_PICK adds Hit.owner
+
+#ifdef TARGET_VULKAN
+layout(set = 0, binding = 6, std430) writeonly buffer PickResult { int pickedIndex; };
+#else
+layout(binding = 6, std430) writeonly buffer PickResult { int pickedIndex; };
+#endif
+
+void main() {
+    const vec3 ro        = u.rayOrigin.xyz;
+    const vec3 rd        = normalize(u.rayDir.xyz);
+    const int  primCount = u.control.x;
+
+    // The same sphere trace and distance-widening epsilon as the reference
+    // marcher (raymarch.comp), so the picked point is the surface under the
+    // clicked pixel and nothing else.
+    const int   kMaxSteps    = 192;
+    const float kMaxDistance = 90.0;
+
+    float travelled = 0.0;
+    int   picked    = -1;
+    for (int step = 0; step < kMaxSteps; ++step) {
+        const vec3  p       = ro + rd * travelled;
+        const Hit   h       = sceneSdf(p, primCount);
+        const float epsilon = 0.0006 * max(travelled, 1.0);
+        if (h.distance < epsilon) {
+            picked = h.owner;
+            break;
+        }
+        travelled += h.distance;
+        if (travelled > kMaxDistance) {
+            break;
+        }
+    }
+    pickedIndex = picked;
+}

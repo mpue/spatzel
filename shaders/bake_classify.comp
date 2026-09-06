@@ -18,7 +18,7 @@ layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
 layout(push_constant) uniform Bake {
     vec4  aabbMin;
     vec4  aabbMax;
-    ivec4 control; // x = primitiveCount, y = pool capacity in slots
+    ivec4 control; // x = primitiveCount, y = pool capacity in slots, z = grid resolution
 } u;
 #else
 layout(binding = 0, std140) uniform Bake {
@@ -40,13 +40,14 @@ layout(binding = 4, std430) buffer Stats { uint stats[]; };
 #endif
 
 void main() {
-    const ivec3 c = ivec3(gl_GlobalInvocationID);
-    if (any(greaterThanEqual(c, ivec3(kGridRes)))) {
+    const int   gridRes = u.control.z;
+    const ivec3 c       = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(c, ivec3(gridRes)))) {
         return;
     }
-    const int idx = cellLinearIndex(c);
+    const int idx = cellLinearIndex(c, gridRes);
 
-    const vec3 step    = cellSizeOf(u.aabbMin.xyz, u.aabbMax.xyz);
+    const vec3 step    = cellSizeOf(u.aabbMin.xyz, u.aabbMax.xyz, gridRes);
     const vec3 cellMin = u.aabbMin.xyz + vec3(c) * step;
     const vec3 center  = cellMin + 0.5 * step;
 

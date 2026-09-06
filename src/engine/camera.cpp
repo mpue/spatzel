@@ -23,6 +23,19 @@ Vec3 FlyCamera::right() const { return normalise(cross(forward(), kWorldUp)); }
 
 Vec3 FlyCamera::up() const { return cross(right(), forward()); }
 
+void FlyCamera::setPose(Vec3 position, Vec3 forward, float fovRadians) {
+    m_position          = position;
+    const Vec3 f        = normalise(forward);
+    m_pitch             = std::clamp(std::asin(std::clamp(f.y, -1.0f, 1.0f)), -kPitchLimit,
+                                     kPitchLimit);
+    // Recover yaw from the horizontal heading (see forward(): x = sin(yaw)·cosP,
+    // z = -cos(yaw)·cosP). atan2 stays well-defined as cosP -> 0 at the poles.
+    m_yaw               = std::atan2(f.x, -f.z);
+    if (fovRadians > 0.0f) {
+        m_verticalFov = fovRadians;
+    }
+}
+
 void FlyCamera::update(const platform::InputState& input, float deltaSeconds) {
     // Look. The delta is already zero unless the cursor is captured, so no
     // check for the right mouse button is needed here.

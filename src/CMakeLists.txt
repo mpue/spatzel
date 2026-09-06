@@ -79,10 +79,17 @@ add_library(fitzel_engine STATIC
     engine/scene.cpp
     engine/scene_io.cpp
     engine/lsystem.cpp
-    engine/editor.cpp)
+    engine/animation.cpp
+    engine/ui_theme.cpp
+    engine/editor.cpp
+    engine/editor_panels.cpp
+    engine/editor_gizmo.cpp
+    engine/editor_lighting.cpp
+    engine/editor_lsystem.cpp
+    engine/editor_timeline.cpp)
 target_link_libraries(fitzel_engine
     PUBLIC  fitzel_rhi fitzel_platform
-    PRIVATE imgui nlohmann_json::nlohmann_json fitzel_warnings)
+    PRIVATE imgui imguizmo nlohmann_json::nlohmann_json fitzel_warnings)
 
 add_executable(fitzel main.cpp)
 target_link_libraries(fitzel PRIVATE fitzel_engine fitzel_rhi_factory fitzel_warnings)

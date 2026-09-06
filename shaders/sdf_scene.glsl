@@ -33,6 +33,7 @@ const int kTypeBox       = 1;
 const int kTypeTorus     = 2;
 const int kTypePlane     = 3;
 const int kTypeRoundCone = 4;
+const int kTypeCylinder  = 5;
 
 const int kOpUnion       = 0;
 const int kOpSmoothUnion = 1;
@@ -81,6 +82,12 @@ float sdPlane(vec3 p, vec3 normal, float offset) {
 // (0, h, 0): radius r0 at the base, r1 at the tip. An exact distance function
 // and 1-Lipschitz, so it is safe for both sphere tracing and the brick
 // occupancy test. This is the branch/trunk primitive the L-system emits.
+// Capped cylinder along local Y: radius r, half-height h. Exact and 1-Lipschitz.
+float sdCappedCylinder(vec3 p, float r, float h) {
+    const vec2 d = abs(vec2(length(p.xz), p.y)) - vec2(r, h);
+    return min(max(d.x, d.y), 0.0) + length(max(d, 0.0));
+}
+
 float sdRoundCone(vec3 p, float r0, float r1, float h) {
     const vec2 q = vec2(length(p.xz), p.y);
 
@@ -117,6 +124,10 @@ float evaluatePrimitive(vec3 worldPoint, Primitive prim) {
         // params: x = height, y = base radius, z = tip radius.
         return sdRoundCone(local, prim.params.y, prim.params.z, prim.params.x);
     }
+    if (prim.control.x == kTypeCylinder) {
+        // params: x = radius, y = half-height.
+        return sdCappedCylinder(local, prim.params.x, prim.params.y);
+    }
     return 1e9;
 }
 
@@ -139,6 +150,13 @@ struct Hit {
     float distance;
     vec3  albedo;
     vec4  material; // x = roughness, y = metallic, z = emissive, w = reserved
+#ifdef FITZEL_PICK
+    // Which primitive "owns" the folded surface at this point — the one whose
+    // material shows. Threaded only for the pick pass (raymarch/brick compile the
+    // unchanged fold), so viewport selection returns the visually-correct
+    // primitive rather than, say, an invisible Subtract cutter. See pick.comp.
+    int owner;
+#endif
 };
 
 // Folds the edit list into a single field, left to right: each primitive
@@ -157,6 +175,9 @@ Hit sceneSdf(vec3 p, int primitiveCount) {
     result.distance = 1e9;
     result.albedo   = vec3(0.8);
     result.material = vec4(0.6, 0.0, 0.0, 0.0); // matte default, matches the CPU side
+#ifdef FITZEL_PICK
+    result.owner = -1;
+#endif
 
     for (int i = 0; i < primitiveCount; ++i) {
         const Primitive prim = scene.primitives[i];
@@ -169,11 +190,18 @@ Hit sceneSdf(vec3 p, int primitiveCount) {
             // transitions its roughness/metallic as legibly as its colour.
             result.albedo   = mix(result.albedo, prim.albedo.rgb, blended.y);
             result.material = mix(result.material, prim.material, blended.y);
+#ifdef FITZEL_PICK
+            // Owner follows the same blend: past the halfway point the new
+            // primitive is the one the eye reads, so it wins the pick.
+            if (blended.y >= 0.5) {
+                result.owner = i;
+            }
+#endif
             result.distance = blended.x;
         } else if (op == kOpSubtract) {
             // Carve this primitive out of the accumulated shape. The newly
             // exposed walls keep the accumulated material — the cutter paints
-            // nothing.
+            // nothing, and it owns nothing either (owner unchanged).
             result.distance = max(result.distance, -d);
         } else if (op == kOpIntersect) {
             // Keep only what is also inside this primitive. The binding surface
@@ -181,12 +209,18 @@ Hit sceneSdf(vec3 p, int primitiveCount) {
             if (d > result.distance) {
                 result.albedo   = prim.albedo.rgb;
                 result.material = prim.material;
+#ifdef FITZEL_PICK
+                result.owner    = i;
+#endif
             }
             result.distance = max(result.distance, d);
         } else { // kOpUnion
             if (d < result.distance) {
                 result.albedo   = prim.albedo.rgb;
                 result.material = prim.material;
+#ifdef FITZEL_PICK
+                result.owner    = i;
+#endif
             }
             result.distance = min(result.distance, d);
         }

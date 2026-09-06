@@ -108,6 +108,12 @@ public:
     [[nodiscard]] Extent2D framebufferSize() const;
     [[nodiscard]] bool     isMinimised() const;
 
+    // DPI scale of the monitor this window is on (1.0 at 96 DPI, 2.0 at 4K/
+    // "200%", etc). The UI multiplies its font size and metrics by this so the
+    // editor stays legible on high-density displays. Returns the larger of the
+    // X/Y content scales; never below 1.0.
+    [[nodiscard]] float contentScale() const;
+
     // True exactly once per framebuffer size change; consumes the flag.
     [[nodiscard]] bool consumeResized();
 

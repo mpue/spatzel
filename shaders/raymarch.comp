@@ -63,7 +63,7 @@ layout(binding = 0, std140) uniform Uniforms {
 // behind it. The start is pushed off the surface along the ray to keep a hit
 // from shadowing itself at the very first step.
 float pointLightShadow(vec3 hit, vec3 normal, int primitiveCount) {
-    const vec3  toLight   = kPointLightPosition - hit;
+    const vec3  toLight   = gLight.pointPos.xyz - hit;
     const float lightDist = length(toLight);
     const vec3  dir       = toLight / lightDist;
 
@@ -204,6 +204,15 @@ void main() {
         const vec3  refl  = reflectionColour(position, normal, rayDirection, hit.material,
                                              u.primitiveCount, texel);
         lit += refl * fres;
+
+        // Glass: replace the opaque shading with the refracted view by the
+        // material's transmission. Marches the exact scene SDF (see shading.glsl).
+        const float transmission = clamp(hit.material.w, 0.0, 1.0);
+        if (transmission > 0.0) {
+            const vec3 glass = traceGlass(position, rayDirection, normal, hit.albedo,
+                                          u.primitiveCount);
+            lit = mix(lit, glass, transmission);
+        }
 
         colour = fadeToBackground(lit, rayDirection, travelled);
     } else {

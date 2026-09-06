@@ -95,15 +95,30 @@ FetchContent_Declare(glad
 # backend into libraries of our own below. The graphics-API render backends are
 # compiled per RHI backend, in src/, so no imgui_impl_<api> ever crosses the
 # seam.
+# Docking branch: the DockSpace / DockBuilder APIs and ImGuiConfigFlags_Docking
+# live only here, not in the tagged releases. Pinned to a specific docking commit
+# (not shallow: a bare SHA off a moving branch cannot be fetched shallowly).
 FetchContent_Declare(imgui
     GIT_REPOSITORY https://github.com/ocornut/imgui.git
-    GIT_TAG        v1.91.8
-    GIT_SHALLOW    ON)
+    GIT_TAG        b334d19b667958ed970000073644d911fae17e57)
 
 FetchContent_Declare(nlohmann_json
     GIT_REPOSITORY https://github.com/nlohmann/json.git
     GIT_TAG        v3.11.3
     GIT_SHALLOW    ON)
+
+# ImGuizmo: the transform gizmo (translate/rotate/scale) for the editor. It sits
+# on top of ImGui — pure ImGui:: / ImGuizmo:: symbols, no graphics API — so it
+# stays above the RHI seam. Pinned to a commit verified against ImGui v1.91.8
+# (it includes imgui_internal.h, so version skew matters). Not shallow: a bare
+# SHA cannot be fetched shallowly.
+FetchContent_Declare(imguizmo
+    GIT_REPOSITORY https://github.com/CedricGuillemet/ImGuizmo.git
+    GIT_TAG        dc25afb98bc3ebe00dfc9a23ba7235fead2ccb1d
+    # ImGuizmo ships its own CMakeLists that declares a conflicting target and
+    # cannot find our ImGui; point SOURCE_SUBDIR at a directory it does not have
+    # so MakeAvailable only downloads the sources — we compile them ourselves.
+    SOURCE_SUBDIR  __fitzel_no_cmake__)
 
 FetchContent_MakeAvailable(glfw)
 
@@ -137,7 +152,7 @@ endif()
 # only windowing, so it lives with the platform layer.
 # ---------------------------------------------------------------------------
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(imgui nlohmann_json)
+FetchContent_MakeAvailable(imgui nlohmann_json imguizmo)
 
 # ImGui core. Third-party, so it is kept off fitzel_warnings.
 add_library(imgui STATIC
@@ -147,6 +162,13 @@ add_library(imgui STATIC
     "${imgui_SOURCE_DIR}/imgui_widgets.cpp")
 target_include_directories(imgui PUBLIC
     "${imgui_SOURCE_DIR}" "${imgui_SOURCE_DIR}/backends")
+
+# ImGuizmo core, compiled against our ImGui. Third-party, so also off
+# fitzel_warnings. Links only ImGui, so nothing here reaches the seam.
+add_library(imguizmo STATIC
+    "${imguizmo_SOURCE_DIR}/src/ImGuizmo.cpp")
+target_include_directories(imguizmo PUBLIC "${imguizmo_SOURCE_DIR}/src")
+target_link_libraries(imguizmo PUBLIC imgui)
 
 # The GLFW platform backend for ImGui. Pure windowing glue — no graphics API —
 # so it belongs beside the platform layer, not behind the seam.

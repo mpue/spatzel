@@ -197,6 +197,14 @@ bool Window::isMinimised() const {
     return size.width == 0 || size.height == 0;
 }
 
+float Window::contentScale() const {
+    float sx = 1.0f;
+    float sy = 1.0f;
+    glfwGetWindowContentScale(asGlfw(m_handle), &sx, &sy);
+    const float scale = sx > sy ? sx : sy;
+    return scale > 1.0f ? scale : 1.0f;
+}
+
 bool Window::consumeResized() {
     const bool resized = m_resized;
     m_resized = false;

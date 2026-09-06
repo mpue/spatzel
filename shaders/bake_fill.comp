@@ -15,7 +15,7 @@ layout(local_size_x = 10, local_size_y = 10, local_size_z = 10) in; // kBrickSiz
 layout(push_constant) uniform Bake {
     vec4  aabbMin;
     vec4  aabbMax;
-    ivec4 control; // x = primitiveCount, y = pool capacity (unused here)
+    ivec4 control; // x = primitiveCount, y = pool capacity (unused here), z = grid resolution
 } u;
 #else
 layout(binding = 0, std140) uniform Bake {
@@ -37,15 +37,16 @@ layout(binding = 3, std430) buffer Bricks { float bricks[]; };
 #endif
 
 void main() {
-    const ivec3 c   = ivec3(gl_WorkGroupID); // one workgroup per cell, kGridRes^3 dispatched
-    const int   idx = cellLinearIndex(c);
-    const Cell  cell = cells[idx];
+    const int   gridRes = u.control.z;
+    const ivec3 c       = ivec3(gl_WorkGroupID); // one workgroup per cell, gridRes^3 dispatched
+    const int   idx     = cellLinearIndex(c, gridRes);
+    const Cell  cell     = cells[idx];
     if (cell.brickSlot < 0) {
         return; // empty cell: no brick to fill
     }
 
     const ivec3 v         = ivec3(gl_LocalInvocationID); // 0..kBrickSize-1
-    const vec3  step      = cellSizeOf(u.aabbMin.xyz, u.aabbMax.xyz);
+    const vec3  step      = cellSizeOf(u.aabbMin.xyz, u.aabbMax.xyz, gridRes);
     const vec3  cellMin   = u.aabbMin.xyz + vec3(c) * step;
     const vec3  voxelStep = step / float(kBrickInterior);
     const vec3  p         = voxelWorldPos(cellMin, voxelStep, v);

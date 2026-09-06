@@ -2,6 +2,7 @@
 
 // Engine layer. Sees rhi.hpp and the platform layer — never a backend.
 
+#include "engine/animation.hpp"
 #include "engine/brick.hpp"
 #include "engine/camera.hpp"
 #include "engine/editor.hpp"
@@ -74,6 +75,7 @@ private:
     void recordReference(rhi::CommandList& cmd);
     void recordBrick(rhi::CommandList& cmd);
     void recordBake(rhi::CommandList& cmd);
+    void recordPick(rhi::CommandList& cmd);
     void reportBakeStats();
     void handleRendererInput();
     void uploadScene();
@@ -117,8 +119,9 @@ private:
         float   aabbMax[4]        = {};
         float   exposure          = 1.0f;
         int32_t reflectionSamples = 4;
+        int32_t gridRes           = brick::kDefaultGridRes; // must match the value the bake used
     };
-    static_assert(sizeof(BrickUniforms) == 120, "brick push constants must stay under 128 bytes");
+    static_assert(sizeof(BrickUniforms) == 124, "brick push constants must stay under 128 bytes");
 
     // Mirrors the push constant block in the bake shaders.
     struct BakeUniforms {
@@ -128,10 +131,39 @@ private:
     };
     static_assert(sizeof(BakeUniforms) == 48, "bake push constants must stay under 128 bytes");
 
+    // Mirrors the push constant block in pick.comp: the ray to trace and the
+    // primitive count. The result (the hit primitive index, or -1) comes back in
+    // m_pickBuffer.
+    struct PickUniforms {
+        float   rayOrigin[4] = {}; // xyz
+        float   rayDir[4]    = {}; // xyz, normalised
+        int32_t control[4]   = {}; // x = primitiveCount
+    };
+    static_assert(sizeof(PickUniforms) == 48, "pick push constants must stay under 128 bytes");
+
+    // The lighting block both marchers read from a storage buffer (slot 5).
+    // vec4-packed to match the std430 layout of LightingParams in shading.glsl
+    // byte for byte; the scalar riders in .w carry the light intensities and the
+    // ambient strength. Assembled from m_lighting whenever the lighting changes.
+    struct GpuLighting {
+        float keyDir[4]        = {}; // xyz direction toward the light, w = intensity
+        float keyColour[4]     = {};
+        float pointPos[4]      = {}; // xyz world position, w = intensity
+        float pointColour[4]   = {};
+        float ambientSky[4]    = {}; // rgb, w = ambient strength
+        float ambientGround[4] = {};
+        float bgHorizon[4]     = {};
+        float bgZenith[4]      = {};
+    };
+    static_assert(sizeof(GpuLighting) == 128,
+                  "lighting buffer must match the std430 block in shading.glsl");
+
     [[nodiscard]] SceneUniforms cameraUniforms() const;
+    void                        uploadLighting();
 
     platform::Window             m_window;
     std::string                  m_shaderRoot;
+    std::string                  m_iniPath; // ImGui layout file; ImGui holds the pointer
     std::unique_ptr<rhi::Device> m_device;
 
     // Reference renderer (brute-force marcher over the edit list).
@@ -145,6 +177,14 @@ private:
     rhi::PipelineHandle m_classifyPipeline = rhi::PipelineHandle::Invalid;
     rhi::ShaderHandle   m_fillShader       = rhi::ShaderHandle::Invalid;
     rhi::PipelineHandle m_fillPipeline     = rhi::PipelineHandle::Invalid;
+
+    // Viewport picking: a one-invocation pass that marches the click ray and
+    // writes the hit primitive index (or -1) for readback.
+    rhi::ShaderHandle   m_pickShader   = rhi::ShaderHandle::Invalid;
+    rhi::PipelineHandle m_pickPipeline = rhi::PipelineHandle::Invalid;
+    rhi::BufferHandle   m_pickBuffer   = rhi::BufferHandle::Invalid;
+    bool                m_pickPending  = false; // a pick was requested this frame
+    PickUniforms        m_pickUniforms{};       // the ray to trace when it is
 
     rhi::TextureHandle  m_renderTarget = rhi::TextureHandle::Invalid;
     rhi::Extent2D       m_targetExtent = {};
@@ -174,10 +214,29 @@ private:
     bool              m_haveBake     = false; // a re-bake has been timed at least once
     double            m_bakeStart    = 0.0;   // wall clock at the timed re-bake's submit
 
+    // The grid resolution the cell buffer currently holds. Set at bake time; the
+    // marcher reads *this*, not the editor's pending value, so the cell indexing
+    // always matches the bake even while the resolution slider is mid-drag.
+    int32_t           m_bakedGridRes = brick::kDefaultGridRes;
+
     RendererMode   m_renderer     = RendererMode::Brick;
     int32_t        m_debugView    = 0;
     bool           m_debugKeyHeld = false;
     RenderSettings m_render;       // exposure + reflection samples, edited in the panel
+
+    // Lighting, edited in the panel and mirrored into a small storage buffer the
+    // marchers read (slot 5). No re-bake on change — bricks store distance, not
+    // shading, so the light buffer is consulted fresh every frame.
+    LightingSettings  m_lighting;
+    rhi::BufferHandle m_lightingBuffer = rhi::BufferHandle::Invalid;
+
+    // Keyframe animation: the clip (per-object pose tracks) and playback state,
+    // both edited by the Timeline panel. The playhead is advanced in the main
+    // loop and the sampled pose written into m_scene each frame while playing or
+    // scrubbing. m_lastAnimTime gates re-sampling to when the time actually moved.
+    AnimationClip  m_animClip;
+    AnimationState m_animState;
+    float          m_lastAnimTime = -1.0f;
 
     // Editor UI.
     Editor                m_editor;

@@ -28,6 +28,7 @@ layout(push_constant) uniform Uniforms {
     vec4  aabbMax;        // xyz
     float exposure;
     int   reflectionSamples; // glossy reflection rays per hit (>=1)
+    int   gridRes;           // dense top-level cells per axis (matches the bake)
 } u;
 #else
 layout(binding = 0, rgba16f) uniform writeonly image2D uOutput;
@@ -43,6 +44,7 @@ layout(binding = 0, std140) uniform Uniforms {
     vec4  aabbMax;
     float exposure;
     int   reflectionSamples;
+    int   gridRes;
 } u;
 #endif
 
@@ -139,14 +141,14 @@ float brickShadow(vec3 origin, vec3 lightPos, vec3 aabbMin, vec3 aabbMax, vec3 c
             break;                 // reached the light or left the grid, unoccluded
         }
         const vec3 p = origin + dir * t;
-        ivec3 ci = clamp(ivec3(floor((p - aabbMin) / cell)), ivec3(0), ivec3(kGridRes - 1));
+        ivec3 ci = clamp(ivec3(floor((p - aabbMin) / cell)), ivec3(0), ivec3(u.gridRes - 1));
 
         const vec3 cellMin = aabbMin + vec3(ci) * cell;
         const vec3 cellMax = cellMin + cell;
         const vec3  ec        = max((cellMin - origin) * invD, (cellMax - origin) * invD);
         const float tCellExit = min(min(ec.x, ec.y), ec.z);
 
-        const Cell entry = cells[cellLinearIndex(ci)];
+        const Cell entry = cells[cellLinearIndex(ci, u.gridRes)];
         if (entry.brickSlot < 0) {
             // Provably surface-free, so it occludes nothing and contributes no
             // penumbra: the cell-centre bound is a distance to the nearest
@@ -199,13 +201,13 @@ vec3 brickReflectionSample(vec3 origin, vec3 dir, vec3 aabbMin, vec3 aabbMax, ve
             break;
         }
         const vec3 p  = origin + dir * t;
-        ivec3 ci = clamp(ivec3(floor((p - aabbMin) / cell)), ivec3(0), ivec3(kGridRes - 1));
+        ivec3 ci = clamp(ivec3(floor((p - aabbMin) / cell)), ivec3(0), ivec3(u.gridRes - 1));
         const vec3 cellMin = aabbMin + vec3(ci) * cell;
         const vec3 cellMax = cellMin + cell;
         const vec3  ec        = max((cellMin - origin) * invD, (cellMax - origin) * invD);
         const float tCellExit = min(min(ec.x, ec.y), ec.z);
 
-        const Cell entry = cells[cellLinearIndex(ci)];
+        const Cell entry = cells[cellLinearIndex(ci, u.gridRes)];
         if (entry.brickSlot < 0) {
             const vec3  center = cellMin + 0.5 * cell;
             const float safe   = abs(entry.emptyDistance) - length(p - center);
@@ -218,7 +220,7 @@ vec3 brickReflectionSample(vec3 origin, vec3 dir, vec3 aabbMin, vec3 aabbMax, ve
                 const vec3  hitPos = origin + dir * t;
                 const vec3  n      = brickNormal(entry.brickSlot, hitPos, cellMin, voxelStep);
                 const Hit   surf   = sceneSdf(hitPos, u.primitiveCount);
-                const float sh     = brickShadow(hitPos + n * 0.03, kPointLightPosition,
+                const float sh     = brickShadow(hitPos + n * 0.03, gLight.pointPos.xyz,
                                                  aabbMin, aabbMax, cell);
                 vec3 lit = shadeHit(surf.albedo, n, hitPos, dir, surf.material, sh);
                 // Sky stand-in for this hit's own reflection (no second bounce),
@@ -286,7 +288,7 @@ void main() {
 
     const vec3 aabbMin = u.aabbMin.xyz;
     const vec3 aabbMax = u.aabbMax.xyz;
-    const vec3 cell    = cellSizeOf(aabbMin, aabbMax);
+    const vec3 cell    = cellSizeOf(aabbMin, aabbMax, u.gridRes);
 
     // A ray exactly parallel to an axis (rd component 0) makes invD infinite,
     // and where such a ray also sits on a cell boundary the slab term becomes
@@ -322,7 +324,7 @@ void main() {
             }
             const vec3  p  = ro + rd * t;
             ivec3 ci = ivec3(floor((p - aabbMin) / cell));
-            ci = clamp(ci, ivec3(0), ivec3(kGridRes - 1));
+            ci = clamp(ci, ivec3(0), ivec3(u.gridRes - 1));
 
             const vec3 cellMin = aabbMin + vec3(ci) * cell;
             const vec3 cellMax = cellMin + cell;
@@ -331,7 +333,7 @@ void main() {
             const vec3  ec = max((cellMin - ro) * invD, (cellMax - ro) * invD);
             const float tCellExit = min(min(ec.x, ec.y), ec.z);
 
-            const Cell entry = cells[cellLinearIndex(ci)];
+            const Cell entry = cells[cellLinearIndex(ci, u.gridRes)];
             if (entry.brickSlot < 0) {
                 // Provably surface-free. Cross at least this cell; the centre
                 // distance is a Lipschitz-1 bound that may let us leap further.
@@ -384,7 +386,7 @@ void main() {
         // off the surface along the normal so the trilinear zero at the hit does
         // not shadow the hit against itself.
         const float shadow = brickShadow(position + normal * 0.03,
-                                         kPointLightPosition, aabbMin, aabbMax, cell);
+                                         gLight.pointPos.xyz, aabbMin, aabbMax, cell);
         vec3 lit = shadeHit(surf.albedo, normal, position, rd, surf.material, shadow);
 
         // Environment/scene specular: a real reflection marched through the brick
@@ -397,6 +399,15 @@ void main() {
         const vec3  refl  = brickReflectionColour(position, normal, rd, surf.material,
                                                   aabbMin, aabbMax, cell, texel);
         lit += refl * fresnelSchlick(ndotv, f0);
+
+        // Glass: blend in the refracted view by the material's transmission. The
+        // refraction path marches the exact scene SDF (shared with the reference
+        // renderer), so glass looks the same in both — only reflections differ.
+        const float transmission = clamp(surf.material.w, 0.0, 1.0);
+        if (transmission > 0.0) {
+            const vec3 glass = traceGlass(position, rd, normal, surf.albedo, u.primitiveCount);
+            lit = mix(lit, glass, transmission);
+        }
 
         colour = fadeToBackground(lit, rd, travelled);
     } else {

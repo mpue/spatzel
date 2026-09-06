@@ -16,21 +16,31 @@
 
 const float kPi = 3.14159265359;
 
-const vec3 kLightDirection = normalize(vec3(0.45, 0.8, 0.35));
-const vec3 kLightColour    = vec3(1.0, 0.97, 0.90);
-const vec3 kAmbientSky     = vec3(0.28, 0.33, 0.42);
-const vec3 kAmbientGround  = vec3(0.14, 0.12, 0.11);
+// All lighting is editor-driven now: the values below arrive in a small storage
+// buffer at slot 5 rather than being baked into the shader. Both marchers bind
+// it (the bake passes do not include this file, so they need no such binding).
+// vec4-packed so std430 alignment is unambiguous; the scalar riders (.w) carry
+// the light intensities and the ambient strength.
+struct LightingParams {
+    vec4 keyDir;        // xyz = direction toward the key light, w = intensity
+    vec4 keyColour;     // rgb tint, w unused
+    vec4 pointPos;      // xyz = world position, w = intensity
+    vec4 pointColour;   // rgb tint, w unused
+    vec4 ambientSky;    // rgb upper hemisphere, w = ambient strength
+    vec4 ambientGround; // rgb lower hemisphere, w unused
+    vec4 bgHorizon;     // rgb background looking at the horizon
+    vec4 bgZenith;      // rgb background looking straight up
+};
 
-// Point light: a warm fill above and to one side of the scene, close enough
-// that its inverse-square falloff shapes the objects rather than lighting them
-// flat. Intensity is folded into the falloff so the colour stays a plain tint.
-const vec3  kPointLightPosition  = vec3(2.0, 4.5, -2.5);
-const vec3  kPointLightColour    = vec3(1.0, 0.6, 0.3);
-const float kPointLightIntensity = 50.0;
+#ifdef TARGET_VULKAN
+layout(set = 0, binding = 5, std430) readonly buffer Lighting { LightingParams gLight; };
+#else
+layout(binding = 5, std430) readonly buffer Lighting { LightingParams gLight; };
+#endif
 
 vec3 background(vec3 rayDirection) {
     const float t = 0.5 * (rayDirection.y + 1.0);
-    return mix(vec3(0.13, 0.14, 0.17), vec3(0.42, 0.52, 0.68), clamp(t, 0.0, 1.0));
+    return mix(gLight.bgHorizon.rgb, gLight.bgZenith.rgb, clamp(t, 0.0, 1.0));
 }
 
 // --- Cook-Torrance terms ----------------------------------------------------
@@ -114,25 +124,110 @@ vec3 shadeHit(vec3 albedo, vec3 normal, vec3 position, vec3 rayDirection,
     const vec3 v  = -rayDirection;
     const vec3 f0 = materialF0(albedo, metallic);
 
-    // Directional key light.
-    vec3 lit = pbrDirect(normal, v, kLightDirection, kLightColour, albedo, f0,
+    // Directional key light. Intensity rides in keyDir.w, so a zeroed intensity
+    // turns the key light off cleanly.
+    const vec3 keyRadiance = gLight.keyColour.rgb * gLight.keyDir.w;
+    vec3 lit = pbrDirect(normal, v, normalize(gLight.keyDir.xyz), keyRadiance, albedo, f0,
                          roughness, metallic);
 
     // Point light: inverse-square falloff, gated by the marched shadow factor.
-    const vec3  toLight = kPointLightPosition - position;
+    const vec3  toLight = gLight.pointPos.xyz - position;
     const float distSq  = max(dot(toLight, toLight), 1e-4);
     const vec3  lDir     = toLight * inversesqrt(distSq);
-    const vec3  radiance = kPointLightColour * (kPointLightIntensity / distSq) * pointShadow;
+    const vec3  radiance = gLight.pointColour.rgb * (gLight.pointPos.w / distSq) * pointShadow;
     lit += pbrDirect(normal, v, lDir, radiance, albedo, f0, roughness, metallic);
 
     // Hemispherical ambient as a cheap diffuse-IBL term; metals take no diffuse.
-    const vec3 ambient = mix(kAmbientGround, kAmbientSky, 0.5 + 0.5 * normal.y) *
-                         albedo * (1.0 - metallic);
+    // ambientSky.w is a single strength multiplier over both hemisphere tints.
+    const vec3 ambient = mix(gLight.ambientGround.rgb, gLight.ambientSky.rgb,
+                             0.5 + 0.5 * normal.y) *
+                         gLight.ambientSky.w * albedo * (1.0 - metallic);
     lit += ambient;
 
     // Emission scales the albedo, so a glowing material keeps its own colour.
     lit += albedo * emissive;
     return lit;
+}
+
+// --- glass (refraction) -----------------------------------------------------
+//
+// Glass is a secondary effect, so both renderers share one implementation that
+// marches the exact scene SDF (the brick marcher pays a little edit-list cost on
+// glass pixels only, which are rare). It is a two-interface model — refract in,
+// cross the object, refract out — with a Fresnel-weighted environment reflection
+// and Beer-Lambert absorption tinting the transmitted light by the albedo. No
+// recursive internal bounces: what lies beyond the glass is shaded once, without
+// its own shadows or reflections, which is plenty convincing and bounds the cost.
+
+const float kGlassIor = 1.5; // typical crown glass
+
+// One scene bounce: march the edit list, shade the first hit (direct + ambient,
+// no shadow ray, no further reflection) or return the sky. This is what the eye
+// sees looking along `rd` — through the glass, or in its mirror reflection.
+vec3 sceneSampleOnce(vec3 ro, vec3 rd, int primitiveCount) {
+    float t = 0.0;
+    for (int i = 0; i < 96; ++i) {
+        const vec3  p   = ro + rd * t;
+        const Hit   h   = sceneSdf(p, primitiveCount);
+        const float eps = 0.0006 * max(t, 1.0);
+        if (h.distance < eps) {
+            const vec3 n = sceneNormal(p, primitiveCount);
+            return shadeHit(h.albedo, n, p, rd, h.material, 1.0);
+        }
+        t += h.distance;
+        if (t > 60.0) {
+            break;
+        }
+    }
+    return background(rd);
+}
+
+// The glass appearance at a front hit: `pos`/`normal` the surface, `rd` the eye
+// ray, `tint` the glass colour (its albedo). Returns linear HDR.
+vec3 traceGlass(vec3 pos, vec3 rd, vec3 normal, vec3 tint, int primitiveCount) {
+    const float f0   = 0.04; // ((ior-1)/(ior+1))^2 for ior 1.5
+    const float fres = f0 + (1.0 - f0) * pow(1.0 - max(dot(-rd, normal), 0.0), 5.0);
+
+    // Environment reflection off the front face.
+    const vec3 reflected = sceneSampleOnce(pos + normal * 0.02, reflect(rd, normal),
+                                           primitiveCount);
+
+    // Refract into the glass. (refract returns 0 on total internal reflection,
+    // which cannot happen entering a denser medium, but guard anyway.)
+    const vec3 rin = refract(rd, normal, 1.0 / kGlassIor);
+    vec3       refracted;
+    if (dot(rin, rin) < 1e-6) {
+        refracted = reflected;
+    } else {
+        // March inside the object (scene SDF is negative there) until the far
+        // surface, accumulating the path length for absorption.
+        vec3  p      = pos + rin * 0.02;
+        float inside = 0.0;
+        for (int i = 0; i < 48; ++i) {
+            const float d = sceneSdf(p, primitiveCount).distance;
+            if (d > -0.002) {
+                break; // reached the exit surface
+            }
+            const float s = max(-d, 0.01);
+            p += rin * s;
+            inside += s;
+        }
+        // Refract back out to air. The exit normal points out of the glass, so
+        // it is flipped to sit on the incident (glass) side for refract().
+        const vec3 exitN = sceneNormal(p, primitiveCount);
+        vec3       rout  = refract(rin, -exitN, kGlassIor);
+        if (dot(rout, rout) < 1e-6) {
+            rout = reflect(rin, -exitN); // total internal reflection at the exit
+        }
+        refracted = sceneSampleOnce(p + rout * 0.02, rout, primitiveCount);
+
+        // Beer-Lambert: a longer path through coloured glass absorbs more of the
+        // complementary light. Clear (white) glass leaves the colour untouched.
+        const vec3 absorb = exp(-(vec3(1.0) - tint) * inside * 1.5);
+        refracted *= absorb;
+    }
+
+    return mix(refracted, reflected, fres);
 }
 
 // --- output transform -------------------------------------------------------

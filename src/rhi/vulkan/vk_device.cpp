@@ -977,19 +977,11 @@ void VulkanDevice::destroy(PipelineHandle handle) {
 // view in CommandList::endUiFrame.
 // ---------------------------------------------------------------------------
 bool VulkanDevice::initUi() {
-    // ImGui manages its font (and any user texture) descriptors from its own
-    // pool, freeing sets as textures come and go — hence FREE_DESCRIPTOR_SET.
-    const VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8};
-    const VkDescriptorPoolCreateInfo poolInfo{
-        .sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .pNext         = nullptr,
-        .flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-        .maxSets       = 8,
-        .poolSizeCount = 1,
-        .pPoolSizes    = &poolSize,
-    };
-    FITZEL_CHECK(
-        vkCreateDescriptorPool(m_device.device, &poolInfo, nullptr, &m_uiDescriptorPool));
+    // The 1.92 backend owns its font/user-texture descriptors itself — the
+    // dynamic font atlas needs separate sampler + sampled-image descriptors, not
+    // a single combined type — so we let it create and size that pool via
+    // DescriptorPoolSize instead of handing it one of ours (m_uiDescriptorPool
+    // stays null; the destroy calls below are then no-ops).
 
     const VkFormat colorFormat = m_swapchain->format();
     VkPipelineRenderingCreateInfo renderingInfo{
@@ -1002,18 +994,22 @@ bool VulkanDevice::initUi() {
         .stencilAttachmentFormat = VK_FORMAT_UNDEFINED,
     };
 
+    // Since the 2025/09/26 backend change the per-pipeline settings (samples,
+    // dynamic-rendering formats) live in a nested PipelineInfoMain struct.
     ImGui_ImplVulkan_InitInfo initInfo{};
-    initInfo.Instance                    = m_instance.instance;
-    initInfo.PhysicalDevice              = m_physicalDevice.physical_device;
-    initInfo.Device                      = m_device.device;
-    initInfo.QueueFamily                 = m_queueFamily;
-    initInfo.Queue                       = m_queue;
-    initInfo.DescriptorPool              = m_uiDescriptorPool;
-    initInfo.MinImageCount               = m_swapchain->imageCount();
-    initInfo.ImageCount                  = m_swapchain->imageCount();
-    initInfo.MSAASamples                 = VK_SAMPLE_COUNT_1_BIT;
-    initInfo.UseDynamicRendering         = true;
-    initInfo.PipelineRenderingCreateInfo = renderingInfo;
+    initInfo.ApiVersion                                     = VK_API_VERSION_1_3;
+    initInfo.Instance                                       = m_instance.instance;
+    initInfo.PhysicalDevice                                 = m_physicalDevice.physical_device;
+    initInfo.Device                                         = m_device.device;
+    initInfo.QueueFamily                                    = m_queueFamily;
+    initInfo.Queue                                          = m_queue;
+    initInfo.DescriptorPool                                 = VK_NULL_HANDLE;
+    initInfo.DescriptorPoolSize                             = 64; // backend-managed
+    initInfo.MinImageCount                                  = m_swapchain->imageCount();
+    initInfo.ImageCount                                     = m_swapchain->imageCount();
+    initInfo.UseDynamicRendering                            = true;
+    initInfo.PipelineInfoMain.MSAASamples                   = VK_SAMPLE_COUNT_1_BIT;
+    initInfo.PipelineInfoMain.PipelineRenderingCreateInfo   = renderingInfo;
 
     if (!ImGui_ImplVulkan_Init(&initInfo)) {
         vkDestroyDescriptorPool(m_device.device, m_uiDescriptorPool, nullptr);

@@ -20,6 +20,7 @@ enum class PrimitiveType : int32_t {
     Torus     = 2,
     Plane     = 3,
     RoundCone = 4, // tapered capsule: the natural branch/trunk primitive
+    Cylinder  = 5, // capped cylinder along local Y
 };
 
 enum class Operator : int32_t {
@@ -51,10 +52,15 @@ static_assert(sizeof(GpuPrimitive) == 96, "GpuPrimitive must match its GLSL coun
 //   RoundCone params.x   = height h, params.y = base radius, params.z = tip radius.
 //             The base sits at `position`; the tip at position + rotation·(0, h, 0).
 //             A proper 1-Lipschitz distance function, like every primitive here.
+//   Cylinder  params.x   = radius, params.y = half-height. Capped, axis local Y.
 //
 // There is no scale: a non-uniform scale destroys the distance metric that
 // sphere tracing depends on. Translation and rotation are what an SDF
 // primitive can carry exactly.
+//
+// material.w is the glass transmission (0 = opaque, 1 = clear): at a hit the
+// marcher refracts through the object and tints the transmitted light by the
+// albedo (Beer-Lambert). See traceGlass in shading.glsl.
 
 // The fixed milestone scene: two spheres melted together by a smooth union, a
 // rotated rounded box, and a ground plane.

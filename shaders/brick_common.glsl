@@ -9,7 +9,9 @@
 // push-constant block so it can be retuned (a wider ground footprint, a taller
 // box) without recompiling a shader.
 
-const int kGridRes       = 64;                                   // dense top-level cells per axis
+// The dense top-level resolution (cells per axis) is a runtime value now: every
+// pass receives it as push-constant data and threads it into the helpers below,
+// so this file no longer hard-codes it. Mirrors engine::brick::kDefaultGridRes.
 const int kBrickInterior = 8;                                    // interior voxels per axis
 const int kBrickApron    = 1;                                    // ghost voxels each side
 const int kBrickSize     = kBrickInterior + 2 * kBrickApron;     // 10
@@ -24,8 +26,8 @@ struct Cell {
     float emptyDistance;
 };
 
-int cellLinearIndex(ivec3 c) {
-    return (c.z * kGridRes + c.y) * kGridRes + c.x;
+int cellLinearIndex(ivec3 c, int gridRes) {
+    return (c.z * gridRes + c.y) * gridRes + c.x;
 }
 
 int voxelLinearIndex(ivec3 v) {
@@ -36,8 +38,8 @@ int voxelLinearIndex(ivec3 v) {
 // is linear, so trilinear reproduces it exactly however coarse the cell, which
 // lets the horizontal axes be stretched to cover more ground without error,
 // while the vertical axis stays fine enough for the objects.
-vec3 cellSizeOf(vec3 aabbMin, vec3 aabbMax) {
-    return (aabbMax - aabbMin) / float(kGridRes);
+vec3 cellSizeOf(vec3 aabbMin, vec3 aabbMax, int gridRes) {
+    return (aabbMax - aabbMin) / float(gridRes);
 }
 
 // World position sampled by voxel `v` (each component 0..kBrickSize-1) of the
