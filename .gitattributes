@@ -1,0 +1,10 @@
+# Shell scripts and Dockerfiles are read by tools that treat a stray CR as part
+# of the command — a CRLF shebang fails with `env: 'bash\r': No such file or
+# directory`, which is an error message that tells you nothing about newlines.
+# So these are LF in the working tree on every platform, whatever a
+# contributor's core.autocrlf is set to.
+*.sh           text eol=lf
+Dockerfile     text eol=lf
+# Docker matches .dockerignore patterns literally, so a trailing CR would make
+# `build/` fail to match the directory `build/`.
+.dockerignore  text eol=lf

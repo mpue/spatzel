@@ -1083,6 +1083,37 @@ CMake ≥ 3.24, all dependencies via `FetchContent` (pinned tags), C++20.
   so it resolves entry points through volk like the rest of the backend.
 - nlohmann/json `v3.11.3` — human-readable scene files.
 
+### Linux in a container
+
+`docker/Dockerfile` carries the Linux toolchain and every development package
+the build needs, in two stages:
+
+- **`deps`** — the packages and nothing else. Mount the working tree and build
+  repeatedly; this is the one to use while iterating.
+- **`build`** (the default target) — the same image with the tree copied in and
+  compiled, so `docker build` is itself a check that the Linux build works.
+
+```
+docker build -t spatzel -f docker/Dockerfile .                  # build + verify
+docker build -t spatzel-deps --target deps -f docker/Dockerfile .
+docker run --rm -v "$PWD:/src" spatzel-deps                     # build the mount
+```
+
+Both paths run `docker/build.sh`, so the image's default command and a mounted
+run cannot drift apart. It configures with Ninja into **`build-linux/`**, not
+`build/`: the tree is usually mounted from a host that has its own `build/` full
+of MSVC state, and a CMake cache from a different generator is not something to
+discover halfway through a configure. `check_seam` runs before the compile, so a
+seam violation fails in seconds instead of after the whole build.
+
+Both GLFW window backends are installed on purpose. The X11 fallback described
+under Platforms would otherwise be the only path this image ever exercised,
+which would leave the Wayland one unproven.
+
+The image does not run the engine — that needs a GPU and a display, and this is
+a build image. The Dockerfile's trailing notes give the flags for trying it
+anyway (`--device /dev/dri` for Mesa, the NVIDIA container runtime otherwise).
+
 The Vulkan SDK is required for the validation layers and for `glslc`; the
 Vulkan headers themselves come from `FetchContent`.
 

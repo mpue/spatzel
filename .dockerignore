@@ -1,0 +1,15 @@
+# The build context is copied into the image, so keep it to sources. The host's
+# build trees are the big one: `build/` alone is hundreds of megabytes of MSVC
+# state that the Linux build would ignore anyway — and a stale CMakeCache from
+# another generator is worse than useless if it ever did get in.
+build/
+build-linux/
+out/
+.git/
+.vs/
+.vscode/
+.idea/
+.cache/
+compile_commands.json
+CMakeUserPresets.json
+*.user
