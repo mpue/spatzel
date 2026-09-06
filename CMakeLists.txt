@@ -57,6 +57,71 @@ set(GLFW_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(GLFW_INSTALL        OFF CACHE BOOL "" FORCE)
 
+# --- GLFW's window backends on Linux ---------------------------------------
+#
+# GLFW 3.4 builds X11 *and* Wayland by default, and the Wayland half needs three
+# things at configure time that a plain toolchain does not have: the
+# wayland-scanner code generator, the wayland-protocols XML, and
+# extra-cmake-modules. Missing any of them fails the configure deep inside GLFW
+# with a message naming wayland-scanner and nothing else — which does not say
+# what to install, and does not say that X11 alone would have worked.
+#
+# So probe for the three, and fall back to X11 with an explanation rather than an
+# error. Falling back is safe even on a Wayland-only desktop: GLFW's X11 backend
+# runs under XWayland. Both are overridable (-DFITZEL_GLFW_WAYLAND=OFF) for
+# anyone who wants to make the choice themselves.
+if(UNIX AND NOT APPLE)
+    option(FITZEL_GLFW_X11     "Build GLFW's X11 backend"     ON)
+    option(FITZEL_GLFW_WAYLAND "Build GLFW's Wayland backend" ON)
+
+    set(FITZEL_GLFW_WAYLAND_ENABLED ${FITZEL_GLFW_WAYLAND})
+
+    if(FITZEL_GLFW_WAYLAND_ENABLED)
+        find_program(FITZEL_WAYLAND_SCANNER NAMES wayland-scanner)
+
+        find_package(PkgConfig QUIET)
+        if(PkgConfig_FOUND)
+            pkg_check_modules(FITZEL_WAYLAND_PROTOCOLS QUIET "wayland-protocols>=1.15")
+        endif()
+
+        # GLFW's own Wayland path does find_package(ECM REQUIRED NO_MODULE).
+        find_package(ECM QUIET NO_MODULE)
+
+        set(FITZEL_WAYLAND_MISSING "")
+        if(NOT FITZEL_WAYLAND_SCANNER)
+            list(APPEND FITZEL_WAYLAND_MISSING "wayland-scanner")
+        endif()
+        if(NOT FITZEL_WAYLAND_PROTOCOLS_FOUND)
+            list(APPEND FITZEL_WAYLAND_MISSING "wayland-protocols (>= 1.15)")
+        endif()
+        if(NOT ECM_FOUND)
+            list(APPEND FITZEL_WAYLAND_MISSING "extra-cmake-modules")
+        endif()
+
+        if(FITZEL_WAYLAND_MISSING)
+            list(JOIN FITZEL_WAYLAND_MISSING ", " FITZEL_WAYLAND_MISSING_TEXT)
+            message(STATUS
+                "fitzel: GLFW Wayland backend disabled - missing ${FITZEL_WAYLAND_MISSING_TEXT}. "
+                "Building X11 only (which runs under XWayland). To enable Wayland, install: "
+                "Debian/Ubuntu 'libwayland-bin wayland-protocols extra-cmake-modules libwayland-dev'; "
+                "Fedora 'wayland-devel wayland-protocols-devel extra-cmake-modules'; "
+                "Arch 'wayland wayland-protocols extra-cmake-modules'.")
+            set(FITZEL_GLFW_WAYLAND_ENABLED OFF)
+        endif()
+    endif()
+
+    if(NOT FITZEL_GLFW_X11 AND NOT FITZEL_GLFW_WAYLAND_ENABLED)
+        message(FATAL_ERROR
+            "fitzel: no GLFW window backend left to build. Enable one of "
+            "FITZEL_GLFW_X11 / FITZEL_GLFW_WAYLAND and install its development "
+            "packages (X11 needs e.g. 'libx11-dev libxrandr-dev libxinerama-dev "
+            "libxcursor-dev libxi-dev' on Debian/Ubuntu).")
+    endif()
+
+    set(GLFW_BUILD_X11     ${FITZEL_GLFW_X11}             CACHE BOOL "" FORCE)
+    set(GLFW_BUILD_WAYLAND ${FITZEL_GLFW_WAYLAND_ENABLED} CACHE BOOL "" FORCE)
+endif()
+
 FetchContent_Declare(vulkan_headers
     GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
     GIT_TAG        vulkan-sdk-1.4.350.1

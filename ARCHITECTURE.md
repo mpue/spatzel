@@ -1037,9 +1037,26 @@ presented image.
 ## Platforms
 
 Windows is the primary target and is what this was verified on. The CMake
-configuration is platform-neutral: no Windows SDK, no `WIN32` branches, no
-per-platform source lists. On Linux, GLFW needs the usual X11 and/or Wayland
-development packages at configure time.
+configuration is otherwise platform-neutral: no Windows SDK, no `WIN32`
+branches, no per-platform source lists.
+
+The one platform branch is GLFW's window backends on Linux. GLFW 3.4 builds X11
+*and* Wayland by default, and the Wayland half needs three things at configure
+time that a plain toolchain does not have: the `wayland-scanner` code generator,
+the `wayland-protocols` XML, and `extra-cmake-modules`. Missing any of them
+fails the configure deep inside GLFW with a message naming `wayland-scanner` and
+nothing else — which says neither what to install nor that X11 alone would have
+worked. So the top-level `CMakeLists.txt` probes for the three and falls back to
+X11 with an explanation instead of an error. That fallback is safe even on a
+Wayland-only desktop, because GLFW's X11 backend runs under XWayland.
+
+Both backends are overridable — `-DFITZEL_GLFW_WAYLAND=OFF`,
+`-DFITZEL_GLFW_X11=OFF` — and turning both off is the one case that is a hard
+error, with the X11 package names in the message. Wayland needs
+`libwayland-bin wayland-protocols extra-cmake-modules libwayland-dev` on
+Debian/Ubuntu (`wayland-devel wayland-protocols-devel extra-cmake-modules` on
+Fedora, `wayland wayland-protocols extra-cmake-modules` on Arch); X11 needs the
+usual `libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev`.
 
 macOS runs the Vulkan backend through MoltenVK and has been verified on an
 Apple M5 Pro. The **OpenGL backend does not work on macOS** and is not expected
