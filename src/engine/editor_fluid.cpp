@@ -87,6 +87,14 @@ void Editor::buildFluidPanel(fluid::Settings& f, const EditorStats& stats,
     ImGui::SetItemTooltip("Restores the level set to a distance function. The renderer\n"
                           "sphere-traces this field, so zero here is not an option.");
 
+    ImGui::Checkbox("Obstacle momentum", &f.obstacleMomentum);
+    ImGui::SetItemTooltip("A moving obstacle pushes the water instead of merely\n"
+                          "occupying it. The boundary velocity is read off the\n"
+                          "obstacle field's own motion, so it needs nothing per\n"
+                          "primitive — but only while a clip is playing: scrubbing\n"
+                          "the timeline is a teleport, not a motion.\n"
+                          "Free-slip, so a spinning obstacle drags nothing along.");
+
     ImGui::SeparatorText("Seed");
     if (ImGui::DragFloat3("Dam min", &f.seedMin.x, 0.02f, -50.0f, 50.0f, "%.2f")) {
         actions.fluidReset = true;

@@ -55,13 +55,15 @@ inline constexpr int64_t kMaxCellCount = cellCount(kMaxRes); // 2,097,152
 inline constexpr int64_t kMaxFaceCount = faceCount(kMaxRes); // 2,146,689
 
 // Total device memory the solver holds once it is switched on, at the ceiling:
-// two velocity buffers (3 components each), two level sets, two pressures, one
-// divergence, one obstacle field. Roughly 93 MiB at res 128, 12 MiB at 64 —
+// two velocity buffers (3 components each), two level sets, one pressure (the
+// red-black sweep updates it in place), one divergence, and two obstacle fields
+// — the distance, and its rate of change. Roughly 93 MiB at res 128, 12 MiB at
+// 64 —
 // but allocated for the ceiling either way, so moving the resolution slider
 // never reallocates a GPU buffer. Nothing is allocated at all until the fluid
 // is first switched on: an engine run that never touches water pays nothing.
 inline constexpr int64_t kResidentFloats =
-    2 * 3 * kMaxFaceCount + 2 * kMaxCellCount + 3 * kMaxCellCount;
+    2 * 3 * kMaxFaceCount + 2 * kMaxCellCount + 4 * kMaxCellCount;
 
 // --- GPU layouts -----------------------------------------------------------
 
@@ -127,6 +129,13 @@ struct Settings {
     int pressureSweeps    = 60;
     int extrapolateSweeps = 4; // how far velocity reaches into the air, in cells
     int reinitIterations  = 4; // redistancing sweeps per step
+
+    // Let a moving obstacle push the water rather than merely occupy it. The
+    // boundary velocity is read off the obstacle field's own motion (see
+    // fluid_solids.comp), so this costs one scalar field and no per-primitive
+    // data. Off, a closed face pins the flow to zero exactly as before — which
+    // is the useful A/B for seeing what the coupling actually does.
+    bool obstacleMomentum = true;
 
     // Seeding: a block of water (the dam) unioned with a still pool below
     // `poolLevel`. Both are exact distance functions, so the seeded field needs

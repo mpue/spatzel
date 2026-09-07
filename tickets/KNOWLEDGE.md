@@ -32,7 +32,9 @@ detail into `knowledge/<topic>.md` and link it here.
   recorded in `recordStep`, in the order that IS the algorithm. Obstacles are the
   edit list, sampled by `fluid_solids.comp`; the marchers read the level set at
   slot 11 and the parameter block at slot 8. See the fluid chapter in
-  ARCHITECTURE.md before changing any of it — the three bugs documented there all
+  ARCHITECTURE.md before changing any of it — including the moving-obstacle
+  coupling, which reads the boundary velocity off the obstacle field's own time
+  derivative rather than from any per-primitive data — the three bugs documented there all
   looked like rendering bugs and were not.
 
 ## Topics

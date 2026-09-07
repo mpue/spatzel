@@ -1,22 +1,36 @@
 #version 450 core
 
 // Obstacle voxelisation: samples the SCENE distance field at every cell centre
-// and stores it.
+// and stores it, together with how fast the obstacle surface is moving there.
 //
-// This is the whole collision system. There is no second collision
+// The field is the whole collision system. There is no second collision
 // representation, no convex hull, no triangle soup — the edit list that defines
 // what the renderer draws is the same list that defines what the water flows
 // around, evaluated by the same shared code (sdf_scene.glsl). Adding an
 // obstacle to the tank is adding a primitive in the editor.
 //
-// Runs only when the scene changes, not per step: the obstacles are static
-// within a frame. Animated primitives therefore need a re-run per frame, which
-// the engine already does whenever the edit list is re-uploaded.
+// The speed is what makes a moving obstacle push water rather than merely
+// occupy it. It is not told to the solver from outside: a level set transported
+// by a velocity satisfies phi_t + v . grad(phi) = 0, so on a distance function
+// the surface's normal speed is -phi_t, which this pass can compute because it
+// is the one that overwrites the previous field. One cell per invocation, read
+// then write, so the aliasing is not a hazard.
+//
+// step.z carries the wall-clock seconds since the last bake, and zero means
+// "this is a jump, not a motion" — a scene edit, a load, an undo, the first
+// bake of a run. Differencing across one of those would fling the water across
+// the tank, so the speed is simply zero there. Deciding which is which is the
+// engine's job, not this shader's.
+//
+// Runs when the scene changes rather than every frame: a static scene needs no
+// re-bake, and re-evaluating the whole edit list per cell is not free once the
+// list runs to hundreds of primitives.
 
 layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
 
 #define FLUID_PUSH
-#define FLUID_SOLID_W
+#define FLUID_SOLID_RW
+#define FLUID_SOLID_SPEED_W
 #include "fluid_common.glsl"
 
 #include "sdf_scene.glsl" // the edit list at slot 1
@@ -28,6 +42,20 @@ void main() {
         return;
     }
 
-    const vec3 p = fluidCellCentre(u.domain.xyz, u.domain.w, id);
-    gSolidOut[fluidCellIndex(id, res)] = sceneDistance(p, u.control.y);
+    const int   cell = fluidCellIndex(id, res);
+    const vec3  p    = fluidCellCentre(u.domain.xyz, u.domain.w, id);
+    const float now  = sceneDistance(p, u.control.y);
+
+    // Read before the overwrite, and only when there is a previous field worth
+    // reading: on the first bake of a run the buffer holds whatever the driver
+    // left there, which must not reach the arithmetic.
+    const float dt = u.step.z;
+    if (dt > 0.0) {
+        const float before = gSolid[cell];
+        gSolidSpeedOut[cell] = (before - now) / dt; // -phi_t, i.e. v . n
+    } else {
+        gSolidSpeedOut[cell] = 0.0;
+    }
+
+    gSolid[cell] = now;
 }

@@ -19,11 +19,18 @@ layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
 #define FLUID_VEL_SRC
 #define FLUID_PHI_SRC
 #define FLUID_SOLID_R
+#define FLUID_SOLID_SPEED_R
 #define FLUID_DIVERGENCE_W
 #include "fluid_common.glsl"
 
+// A closed face contributes the boundary's own velocity, not zero. For a
+// stationary obstacle that is zero and nothing changes; for a moving one this is
+// where the momentum enters the system — the pressure solve sees a cell whose
+// faces do not balance and builds exactly the pressure that pushes the water out
+// of the way.
 float faceVelocity(int axis, ivec3 f, int res) {
-    return fluidFaceClosed(axis, f, res) ? 0.0 : fluidVelAt(axis, f, res);
+    return fluidFaceClosed(axis, f, res) ? fluidClosedFaceVelocity(axis, f, res)
+                                         : fluidVelAt(axis, f, res);
 }
 
 void main() {

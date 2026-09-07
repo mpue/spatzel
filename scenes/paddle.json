@@ -1,0 +1,98 @@
+{
+  "version": 4,
+  "primitives": [
+    {
+      "type": "Plane",
+      "operator": "Union",
+      "id": 0,
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "blend": 0.0,
+      "params": [0.0, 1.0, 0.0, 0.0],
+      "albedo": [0.34, 0.35, 0.38],
+      "roughness": 0.65,
+      "metallic": 0.0,
+      "emissive": 0.0,
+      "transmission": 0.0
+    },
+    {
+      "type": "Box",
+      "operator": "Union",
+      "id": 1,
+      "position": [-2.2, 0.95, 0.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "blend": 0.0,
+      "params": [0.14, 0.95, 1.5, 0.03],
+      "albedo": [0.86, 0.42, 0.24],
+      "roughness": 0.4,
+      "metallic": 0.0,
+      "emissive": 0.0,
+      "transmission": 0.0
+    },
+    {
+      "type": "Cylinder",
+      "operator": "Union",
+      "id": 0,
+      "position": [1.7, 0.6, -1.9],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "blend": 0.0,
+      "params": [0.28, 0.6, 0.0, 0.0],
+      "albedo": [0.72, 0.68, 0.60],
+      "roughness": 0.45,
+      "metallic": 0.0,
+      "emissive": 0.0,
+      "transmission": 0.0
+    }
+  ],
+  "animation": {
+    "duration": 4.0,
+    "linear": true,
+    "tracks": [
+      {
+        "objectId": 1,
+        "keys": [
+          {
+            "time": 0.0,
+            "position": [-2.2, 0.95, 0.0],
+            "rotation": [0.0, 0.0, 0.0, 1.0],
+            "dims": [0.14, 0.95, 1.5, 0.03]
+          },
+          {
+            "time": 2.0,
+            "position": [2.2, 0.95, 0.0],
+            "rotation": [0.0, 0.0, 0.0, 1.0],
+            "dims": [0.14, 0.95, 1.5, 0.03]
+          },
+          {
+            "time": 4.0,
+            "position": [-2.2, 0.95, 0.0],
+            "rotation": [0.0, 0.0, 0.0, 1.0],
+            "dims": [0.14, 0.95, 1.5, 0.03]
+          }
+        ]
+      }
+    ]
+  },
+  "fluid": {
+    "enabled": true,
+    "resolution": 64,
+    "origin": [-3.0, 0.0, -3.0],
+    "size": 6.0,
+    "timestep": 0.008333333,
+    "maxSubsteps": 2,
+    "gravity": -9.81,
+    "pressureSweeps": 60,
+    "extrapolateSweeps": 4,
+    "reinitIterations": 4,
+    "obstacleMomentum": true,
+    "seedMin": [-40.0, -40.0, -40.0],
+    "seedMax": [-40.0, -40.0, -40.0],
+    "poolLevel": 0.75,
+    "colour": [0.62, 0.82, 0.88],
+    "transmission": 0.9,
+    "roughness": 0.03,
+    "ior": 1.33,
+    "trustBandCells": 8.0,
+    "surfaceOffset": 0.0
+  }
+}

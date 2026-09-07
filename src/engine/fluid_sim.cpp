@@ -55,22 +55,26 @@ void FluidSim::create(rhi::Device& device) {
     // twice, and they have to be read together.
     const std::array seedBindings{storage(kSlotVelDst), storage(kSlotPhiDst),
                                   storage(kSlotPressure)};
-    const std::array solidsBindings{storage(kSlotScene), storage(kSlotSolid)};
+    const std::array solidsBindings{storage(kSlotScene), storage(kSlotSolid),
+                                    storage(kSlotSolidSpeed)};
     const std::array advectBindings{storage(kSlotVelSrc), storage(kSlotVelDst),
                                     storage(kSlotPhiSrc), storage(kSlotPhiDst),
-                                    storage(kSlotSolid)};
+                                    storage(kSlotSolid), storage(kSlotSolidSpeed)};
     const std::array divergenceBindings{storage(kSlotVelSrc), storage(kSlotPhiSrc),
-                                        storage(kSlotSolid), storage(kSlotDivergence)};
+                                        storage(kSlotSolid), storage(kSlotSolidSpeed),
+                                        storage(kSlotDivergence)};
     const std::array pressureBindings{storage(kSlotPhiSrc), storage(kSlotSolid),
                                       storage(kSlotDivergence), storage(kSlotPressure)};
     const std::array projectBindings{storage(kSlotVelSrc), storage(kSlotVelDst),
                                      storage(kSlotPhiSrc), storage(kSlotSolid),
-                                     storage(kSlotPressure)};
+                                     storage(kSlotSolidSpeed), storage(kSlotPressure)};
     const std::array extrapolateBindings{storage(kSlotVelSrc), storage(kSlotVelDst),
-                                         storage(kSlotPhiSrc), storage(kSlotSolid)};
+                                         storage(kSlotPhiSrc), storage(kSlotSolid),
+                                         storage(kSlotSolidSpeed)};
     const std::array reinitBindings{storage(kSlotPhiSrc), storage(kSlotPhiDst)};
     const std::array statsBindings{storage(kSlotVelSrc), storage(kSlotPhiSrc),
-                                   storage(kSlotSolid), storage(kSlotStats)};
+                                   storage(kSlotSolid), storage(kSlotSolidSpeed),
+                                   storage(kSlotStats)};
 
     m_seedPass        = makePass("fluid_seed", seedBindings);
     m_solidsPass      = makePass("fluid_solids", solidsBindings);
@@ -131,6 +135,7 @@ void FluidSim::ensureFields() {
 
     m_divergenceBuffer = field(cellBytes, "fluid_divergence");
     m_solidBuffer      = field(cellBytes, "fluid_solid");
+    m_solidSpeedBuffer = field(cellBytes, "fluid_solid_speed");
 
     m_needSeed   = true;
     m_needSolids = true;
@@ -142,7 +147,7 @@ void FluidSim::destroyFields() {
     }
     for (rhi::BufferHandle* buffer :
          {&m_velocity[0], &m_velocity[1], &m_phi[0], &m_phi[1], &m_pressureBuffer,
-          &m_divergenceBuffer, &m_solidBuffer}) {
+          &m_divergenceBuffer, &m_solidBuffer, &m_solidSpeedBuffer}) {
         if (rhi::isValid(*buffer)) {
             m_device->destroy(*buffer);
             *buffer = rhi::BufferHandle::Invalid;
@@ -248,16 +253,23 @@ void FluidSim::recordSeed(rhi::CommandList& cmd, const fluid::GpuPush& push, int
 }
 
 void FluidSim::recordSolids(rhi::CommandList& cmd, const fluid::GpuPush& push, int res,
-                            rhi::BufferHandle sceneBuffer) {
+                            rhi::BufferHandle sceneBuffer, float motionSeconds) {
     const uint32_t groups = divideRoundUp(static_cast<uint32_t>(res), kGroupSize);
 
+    // step.z is the interval the bake differences the obstacle field across.
+    // Zero disables the momentum term for this bake: the obstacle jumped rather
+    // than moved, and there is no velocity to read off a jump.
+    fluid::GpuPush bake = push;
+    bake.step[2]        = motionSeconds;
+
     cmd.bindComputePipeline(m_solidsPass.pipeline);
-    cmd.pushConstants(asBytes(push));
+    cmd.pushConstants(asBytes(bake));
     // The edit list, at the slot every pass in the engine reads it from. Bound
     // here rather than relying on the frame's earlier binding: binding a
     // pipeline drops the descriptors bound for the previous one, by contract.
     cmd.bindStorageBuffer(kSlotScene, sceneBuffer);
     cmd.bindStorageBuffer(kSlotSolid, m_solidBuffer);
+    cmd.bindStorageBuffer(kSlotSolidSpeed, m_solidSpeedBuffer);
     cmd.dispatch(groups, groups, groups);
 }
 
@@ -280,6 +292,7 @@ void FluidSim::recordSubstep(rhi::CommandList& cmd, const fluid::Settings& setti
     cmd.bindStorageBuffer(kSlotPhiSrc, phiSrc());
     cmd.bindStorageBuffer(kSlotPhiDst, phiDst());
     cmd.bindStorageBuffer(kSlotSolid, m_solidBuffer);
+    cmd.bindStorageBuffer(kSlotSolidSpeed, m_solidSpeedBuffer);
     cmd.dispatch(faceGroups, faceGroups, faceGroups);
     m_velocityIndex = 1 - m_velocityIndex;
     m_phiIndex      = 1 - m_phiIndex;
@@ -290,6 +303,7 @@ void FluidSim::recordSubstep(rhi::CommandList& cmd, const fluid::Settings& setti
     cmd.bindStorageBuffer(kSlotVelSrc, velSrc());
     cmd.bindStorageBuffer(kSlotPhiSrc, phiSrc());
     cmd.bindStorageBuffer(kSlotSolid, m_solidBuffer);
+    cmd.bindStorageBuffer(kSlotSolidSpeed, m_solidSpeedBuffer);
     cmd.bindStorageBuffer(kSlotDivergence, m_divergenceBuffer);
     cmd.dispatch(cellGroups, cellGroups, cellGroups);
 
@@ -319,6 +333,7 @@ void FluidSim::recordSubstep(rhi::CommandList& cmd, const fluid::Settings& setti
     cmd.bindStorageBuffer(kSlotVelDst, velDst());
     cmd.bindStorageBuffer(kSlotPhiSrc, phiSrc());
     cmd.bindStorageBuffer(kSlotSolid, m_solidBuffer);
+    cmd.bindStorageBuffer(kSlotSolidSpeed, m_solidSpeedBuffer);
     cmd.bindStorageBuffer(kSlotPressure, m_pressureBuffer);
     cmd.dispatch(faceGroups, faceGroups, faceGroups);
     m_velocityIndex = 1 - m_velocityIndex;
@@ -332,6 +347,7 @@ void FluidSim::recordSubstep(rhi::CommandList& cmd, const fluid::Settings& setti
         cmd.bindStorageBuffer(kSlotVelDst, velDst());
         cmd.bindStorageBuffer(kSlotPhiSrc, phiSrc());
         cmd.bindStorageBuffer(kSlotSolid, m_solidBuffer);
+        cmd.bindStorageBuffer(kSlotSolidSpeed, m_solidSpeedBuffer);
         cmd.dispatch(faceGroups, faceGroups, faceGroups);
         m_velocityIndex = 1 - m_velocityIndex;
     }
@@ -361,6 +377,7 @@ void FluidSim::recordStats(rhi::CommandList& cmd, const fluid::GpuPush& push, in
     cmd.bindStorageBuffer(kSlotVelSrc, m_velocity[m_velocityIndex]);
     cmd.bindStorageBuffer(kSlotPhiSrc, m_phi[m_phiIndex]);
     cmd.bindStorageBuffer(kSlotSolid, m_solidBuffer);
+    cmd.bindStorageBuffer(kSlotSolidSpeed, m_solidSpeedBuffer);
     cmd.bindStorageBuffer(kSlotStats, m_statsBuffer);
     cmd.dispatch(groups, groups, groups);
 }
@@ -386,15 +403,28 @@ void FluidSim::recordStep(rhi::CommandList& cmd, const fluid::Settings& settings
         m_needSolids = true;
     }
 
+    // The obstacle field, and with it the boundary velocity the water feels.
+    //
+    // The bake only runs when the scene changed, which means a frame with no
+    // change leaves the speed field holding the last motion — an obstacle that
+    // has stopped would go on shoving water forever. So the frame after the last
+    // motion clears it, once.
     if (m_needSolids) {
-        recordSolids(cmd, push, res, sceneBuffer);
-        m_needSolids = false;
+        const float motion = settings.obstacleMomentum ? m_solidsMotion : 0.0f;
+        recordSolids(cmd, push, res, sceneBuffer, motion);
+        m_needSolids     = false;
+        m_solidsMotion   = 0.0f;
+        m_solidSpeedLive = motion > 0.0f;
+    } else if (m_solidSpeedLive) {
+        cmd.clearBuffer(m_solidSpeedBuffer);
+        m_solidSpeedLive = false;
     }
 
     if (m_needSeed) {
         recordSeed(cmd, push, res);
         m_needSeed             = false;
         m_seededRes            = res;
+        m_solidsMotion         = 0.0f;
         m_timeDebt             = 0.0f;
         m_referencePending     = true;
         m_referenceVolumeMilli = 0.0f;

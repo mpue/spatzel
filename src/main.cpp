@@ -23,6 +23,8 @@ void printUsage() {
                  "  --max-outlier-fraction <f> pass --compare if at most this fraction of\n"
                  "                             components exceed tolerance (default 0 = strict max)\n"
                  "  --no-ui                    disable the editor overlay\n"
+                 "  --fluid                    start with the water simulation enabled\n"
+                 "  --play                     start the animation clip playing (looping)\n"
                  "  --scene <file>             load this scene JSON at startup\n"
                  "  --save-scene <file>        write the built-in (or --scene) list and exit\n"
                  "\n"
@@ -100,6 +102,8 @@ int main(int argc, char** argv) {
                 config.maxOutlierFraction = std::strtof(argv[++i], nullptr);
             } else if (arg == "--fluid") {
                 config.fluid = true;
+            } else if (arg == "--play") {
+                config.play = true;
             } else if (arg == "--no-ui") {
                 config.enableUi = false;
             } else if (arg == "--scene" && hasValue) {

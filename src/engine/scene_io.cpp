@@ -135,6 +135,7 @@ void saveScene(const std::filesystem::path& path, const std::vector<GpuPrimitive
             {"pressureSweeps", f.pressureSweeps},
             {"extrapolateSweeps", f.extrapolateSweeps},
             {"reinitIterations", f.reinitIterations},
+            {"obstacleMomentum", f.obstacleMomentum},
             {"seedMin", {f.seedMin.x, f.seedMin.y, f.seedMin.z}},
             {"seedMax", {f.seedMax.x, f.seedMax.y, f.seedMax.z}},
             {"poolLevel", f.poolLevel},
@@ -257,6 +258,7 @@ std::vector<GpuPrimitive> loadScene(const std::filesystem::path& path, Animation
         s.pressureSweeps    = f.value("pressureSweeps", s.pressureSweeps);
         s.extrapolateSweeps = f.value("extrapolateSweeps", s.extrapolateSweeps);
         s.reinitIterations  = f.value("reinitIterations", s.reinitIterations);
+        s.obstacleMomentum  = f.value("obstacleMomentum", s.obstacleMomentum);
         s.poolLevel         = f.value("poolLevel", s.poolLevel);
         s.transmission      = f.value("transmission", s.transmission);
         s.roughness         = f.value("roughness", s.roughness);

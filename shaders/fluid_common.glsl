@@ -162,8 +162,18 @@ FLUID_SET binding = 15, std430) writeonly buffer FluidDivergenceW { float gDiver
 #ifdef FLUID_SOLID_R
 FLUID_SET binding = 16, std430) readonly buffer FluidSolidR { float gSolid[]; };
 #endif
-#ifdef FLUID_SOLID_W
-FLUID_SET binding = 16, std430) writeonly buffer FluidSolidW { float gSolidOut[]; };
+#ifdef FLUID_SOLID_RW
+// Read-write for the bake alone, which needs the previous frame's obstacle
+// field to see how far the obstacle moved. Each invocation touches only its own
+// cell, so reading the old value and writing the new one in the same dispatch is
+// not a hazard.
+FLUID_SET binding = 16, std430) buffer FluidSolidRW { float gSolid[]; };
+#endif
+#ifdef FLUID_SOLID_SPEED_R
+FLUID_SET binding = 18, std430) readonly buffer FluidSolidSpeedR { float gSolidSpeed[]; };
+#endif
+#ifdef FLUID_SOLID_SPEED_W
+FLUID_SET binding = 18, std430) writeonly buffer FluidSolidSpeedW { float gSolidSpeedOut[]; };
 #endif
 #ifdef FLUID_STATS
 FLUID_SET binding = 17, std430) buffer FluidStatsBlock { uint gStats[]; };
@@ -193,6 +203,61 @@ bool fluidFaceClosed(int axis, ivec3 f, int res) {
     ivec3 lo = f;
     lo[axis] -= 1;
     return fluidSolidCell(lo, res) || fluidSolidCell(f, res);
+}
+#endif
+
+#if defined(FLUID_SOLID_R) && defined(FLUID_SOLID_SPEED_R)
+// The velocity a closed face imposes on the fluid — zero for a stationary
+// obstacle, and the obstacle's own velocity along this face's axis when it
+// moves. This is the whole of the moving-obstacle coupling: every pass that
+// used to write a hard zero at a closed face writes this instead.
+//
+// The obstacle's velocity is never told to the solver. It is *read off the
+// obstacle field's own motion*: a level set transported by a velocity satisfies
+// phi_t + v . grad(phi) = 0, so on a field that is a distance function
+// (|grad phi| = 1) the surface's normal speed is simply -phi_t. The bake stores
+// that scalar per cell; the direction comes from the gradient here.
+//
+// Only the normal component is recoverable that way — a sphere spinning in place
+// has phi_t = 0 everywhere — and only the normal component is wanted: the
+// boundary condition here is free-slip, constraining u . n and leaving the
+// tangential flow alone. A no-slip wall that drags water around with it would
+// need the tangential velocity too, and that genuinely would need per-primitive
+// motion data.
+float fluidClosedFaceVelocity(int axis, ivec3 f, int res) {
+    if (fluidWallFace(axis, f, res)) {
+        return 0.0; // the tank itself never moves
+    }
+
+    ivec3 lo = f;
+    lo[axis] -= 1;
+
+    // The obstacle half of the pair: the face is closed, so at least one of the
+    // two cells is inside the obstacle, and that one's field describes the
+    // surface that is moving.
+    const ivec3 c = fluidSolidCell(lo, res) ? lo : f;
+
+    const float speed = gSolidSpeed[fluidCellIndex(clamp(c, ivec3(0), ivec3(res - 1)), res)];
+    if (speed == 0.0) {
+        return 0.0; // stationary obstacle: the old hard zero, reached cheaply
+    }
+
+    // The surface normal, from the gradient of the obstacle field. The 1/(2h)
+    // of the central difference cancels in the normalisation, so it is left out.
+    vec3 g;
+    for (int a = 0; a < 3; ++a) {
+        ivec3 gh = c;
+        ivec3 gl = c;
+        gh[a] += 1;
+        gl[a] -= 1;
+        g[a] = fluidSolidAt(gh, res) - fluidSolidAt(gl, res);
+    }
+
+    const float len = length(g);
+    if (len < 1.0e-6) {
+        return 0.0; // no usable normal — do not invent a direction
+    }
+    return speed * (g[axis] / len);
 }
 #endif
 

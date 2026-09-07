@@ -14,6 +14,7 @@
 #include "engine/fluid.hpp"
 #include "rhi/rhi.hpp"
 
+#include <algorithm>
 #include <array>
 #include <span>
 
@@ -39,7 +40,20 @@ public:
 
     // The obstacle field is a sample of the scene distance field, so it is
     // stale whenever the edit list or the domain changes.
-    void invalidateSolids() { m_needSolids = true; }
+    //
+    // `motionSeconds` is the wall clock over which the change happened, and it
+    // is what separates an obstacle that MOVED from one that JUMPED. A moving
+    // obstacle pushes water: the bake differences the field it is replacing and
+    // the solver reads a boundary velocity off that. A jump — a typed value, a
+    // load, an undo, a scrub of the timeline — has no meaningful duration, and
+    // differencing across one would fling the water across the tank. Zero, the
+    // default, says "jump": the obstacle simply is somewhere else now.
+    void invalidateSolids(float motionSeconds = 0.0f) {
+        m_needSolids = true;
+        // Several invalidations can land before the one bake that answers them
+        // all; the largest motion is the honest description of the interval.
+        m_solidsMotion = std::max(m_solidsMotion, motionSeconds);
+    }
 
     // Records the obstacle bake (if stale), the reset (if requested), the
     // substeps for `frameSeconds` of wall clock, and the diagnostics pass. Does
@@ -96,6 +110,7 @@ private:
         kSlotDivergence = 15,
         kSlotSolid      = 16,
         kSlotStats      = 17,
+        kSlotSolidSpeed = 18,
     };
 
     Pass makePass(const char* name, std::span<const rhi::BindingDesc> bindings);
@@ -107,7 +122,7 @@ private:
 
     void recordSeed(rhi::CommandList& cmd, const fluid::GpuPush& push, int res);
     void recordSolids(rhi::CommandList& cmd, const fluid::GpuPush& push, int res,
-                      rhi::BufferHandle sceneBuffer);
+                      rhi::BufferHandle sceneBuffer, float motionSeconds);
     void recordSubstep(rhi::CommandList& cmd, const fluid::Settings& settings,
                        const fluid::GpuPush& push);
     void recordStats(rhi::CommandList& cmd, const fluid::GpuPush& push, int res);
@@ -140,11 +155,23 @@ private:
 
     rhi::BufferHandle m_divergenceBuffer = rhi::BufferHandle::Invalid;
     rhi::BufferHandle m_solidBuffer      = rhi::BufferHandle::Invalid;
+    // How fast the obstacle surface is moving, per cell, normal component only.
+    // Written by the bake from the field it replaces; read by every pass that
+    // has to decide what a closed face does.
+    rhi::BufferHandle m_solidSpeedBuffer = rhi::BufferHandle::Invalid;
     rhi::BufferHandle m_statsBuffer      = rhi::BufferHandle::Invalid;
     rhi::BufferHandle m_params           = rhi::BufferHandle::Invalid;
 
     bool m_needSeed   = true;
     bool m_needSolids = true;
+
+    // Wall-clock seconds the pending obstacle change took; 0 means it was a jump.
+    float m_solidsMotion = 0.0f;
+    // True while the speed field holds a nonzero motion. When a frame goes by
+    // with no re-bake, that motion is over — and a stale speed field would keep
+    // shoving water with an obstacle that has already stopped, so it is cleared
+    // exactly once and the flag goes down.
+    bool  m_solidSpeedLive = false;
 
     // The resolution the live fields were seeded at. Changing the resolution
     // reinterprets every index, so it forces a re-seed rather than resampling —

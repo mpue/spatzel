@@ -17,6 +17,7 @@ layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
 #define FLUID_VEL_DST
 #define FLUID_PHI_SRC
 #define FLUID_SOLID_R
+#define FLUID_SOLID_SPEED_R
 #define FLUID_PRESSURE
 #include "fluid_common.glsl"
 
@@ -37,8 +38,14 @@ void main() {
 
     for (int axis = 0; axis < 3; ++axis) {
         const int index = fluidVelIndex(axis, id, res);
-        if (!fluidFaceLive(axis, id, res) || fluidFaceClosed(axis, id, res)) {
-            gVelDst[index] = 0.0;
+        if (!fluidFaceLive(axis, id, res)) {
+            gVelDst[index] = 0.0; // slack face of the shared lattice
+            continue;
+        }
+        if (fluidFaceClosed(axis, id, res)) {
+            // Pinned to the boundary's velocity, not projected: this face is the
+            // boundary condition the solve was given, not an unknown it solved.
+            gVelDst[index] = fluidClosedFaceVelocity(axis, id, res);
             continue;
         }
 

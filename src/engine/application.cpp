@@ -120,6 +120,11 @@ Application::Application(const AppConfig& config)
     // --fluid switches the water on; it never switches off what a scene file
     // asked for, so the flag and the file compose instead of fighting.
     m_fluidSettings.enabled = m_fluidSettings.enabled || config.fluid;
+
+    if (config.play) {
+        m_animState.playing = true;
+        m_animState.loop    = true;
+    }
     m_fluid.uploadParams(m_fluidSettings);
 
     resizeRenderTarget(m_device->swapchainExtent());
@@ -403,7 +408,7 @@ bool Application::run() {
         const bool editing =
             m_uiEnabled && (ImGuizmo::IsUsing() || ImGui::IsAnyItemActive());
         if (m_animState.playing && !editing && m_animClip.duration > 0.0f) {
-            m_animState.time += deltaSeconds * m_animState.speed;
+            m_animState.time += simulationDelta() * m_animState.speed;
             if (m_animState.time >= m_animClip.duration) {
                 if (m_animState.loop) {
                     m_animState.time = std::fmod(m_animState.time, m_animClip.duration);
@@ -599,8 +604,12 @@ void Application::renderFrame() {
             uploadScene();
             m_needBake = true;
             // Obstacles are the edit list, so an animated primitive moves the
-            // walls the water flows around.
-            m_fluid.invalidateSolids();
+            // walls the water flows around — and while the clip is *playing* it
+            // moves them at a knowable rate, which is what lets the water be
+            // pushed rather than merely displaced. Scrubbing hands over no
+            // interval: dragging the playhead is a teleport, and a teleport that
+            // claimed a duration would fling the water across the tank.
+            m_fluid.invalidateSolids(m_animState.playing ? simulationDelta() : 0.0f);
         }
         // The camera track drives the camera directly (no scene upload/bake — the
         // camera only feeds the marcher uniforms, read fresh every frame).
@@ -633,7 +642,7 @@ void Application::renderFrame() {
     // list: the RHI orders dispatches against each other, so the marcher below
     // sees exactly what the solver just wrote, with no barrier spelled out here.
     m_fluid.recordStep(cmd, m_fluidSettings, m_sceneBuffer, static_cast<int>(m_scene.size()),
-                       fluidFrameSeconds());
+                       simulationDelta());
     // After recording, because the block carries the resolution the fields were
     // actually seeded at — which recordStep may have just changed.
     m_fluid.uploadParams(m_fluidSettings);
@@ -709,17 +718,15 @@ void Application::renderFrame() {
     }
 }
 
-float Application::fluidFrameSeconds() const {
-    // A pinned run has to reproduce, and a solver driven by the wall clock does
-    // not: two runs would step the water a different number of times and diverge
-    // immediately. So a pinned run spends a fixed substep budget per frame and
-    // the water's state becomes a function of the frame index alone. Same
-    // reasoning as the pinned animation clock and the frozen camera.
-    if (m_pinTime) {
-        return m_fluidSettings.timestep *
-               static_cast<float>(std::max(m_fluidSettings.maxSubsteps, 1));
-    }
-    return m_frameDelta;
+float Application::simulationDelta() const {
+    // A pinned run has to reproduce, and anything driven by the wall clock does
+    // not: two runs would step the water a different number of times, move an
+    // animated obstacle by a different distance, and diverge immediately. So a
+    // pinned run declares every frame to be the same length and the world
+    // becomes a function of the frame index alone. Same reasoning as the frozen
+    // camera and the fixed shader clock.
+    constexpr float kPinnedFrameSeconds = 1.0f / 60.0f;
+    return m_pinTime ? kPinnedFrameSeconds : m_frameDelta;
 }
 
 Application::SceneUniforms Application::cameraUniforms() const {

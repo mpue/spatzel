@@ -22,6 +22,7 @@ layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
 #define FLUID_PHI_SRC
 #define FLUID_PHI_DST
 #define FLUID_SOLID_R
+#define FLUID_SOLID_SPEED_R
 #include "fluid_common.glsl"
 
 void main() {
@@ -43,7 +44,9 @@ void main() {
             continue;
         }
         if (fluidFaceClosed(axis, id, res)) {
-            gVelDst[index] = 0.0; // wall or obstacle: no normal flow through it
+            // No flow *through* the boundary — but the boundary itself may be
+            // moving, and then the fluid on the far side has to move with it.
+            gVelDst[index] = fluidClosedFaceVelocity(axis, id, res);
             continue;
         }
 

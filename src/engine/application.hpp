@@ -35,6 +35,10 @@ struct AppConfig {
     // Switch the water on at startup (--fluid). Off by default: the solver
     // allocates nothing and costs nothing until it is enabled.
     bool                  fluid       = false;
+    // Start the animation clip playing. Without it a headless run holds the
+    // playhead at zero, so nothing moves and an animated scene dumps its rest
+    // pose. Looping, so a long run keeps producing motion.
+    bool                  play        = false;
     // 0 = shaded, 1 = step-count heat, 2 = brick/empty tint. Brick renderer only.
     int32_t               debugView   = 0;
     // Show the Dear ImGui editor panel. Forced off for pinned verification runs
@@ -72,8 +76,12 @@ public:
 
 private:
     void renderFrame();
-    // Wall-clock seconds the fluid solver is asked to catch up on this frame.
-    [[nodiscard]] float fluidFrameSeconds() const;
+    // Seconds the simulated world advances this frame: the wall clock normally,
+    // a fixed step when the run is pinned. Everything that integrates — the
+    // animation playhead, the obstacle velocity the water feels, the fluid
+    // substeps — reads it from here, so a pinned run is a function of the frame
+    // index and two runs of it agree.
+    [[nodiscard]] float simulationDelta() const;
     void resizeRenderTarget(rhi::Extent2D extent);
     void destroyRenderTarget();
 

@@ -26,11 +26,15 @@ layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
 #define FLUID_VEL_SRC
 #define FLUID_PHI_SRC
 #define FLUID_SOLID_R
+#define FLUID_SOLID_SPEED_R
 #define FLUID_STATS
 #include "fluid_common.glsl"
 
+// Matches fluid_divergence.comp exactly: the residual is only meaningful if it
+// is measured against the same stencil the solve was given.
 float faceVelocity(int axis, ivec3 f, int res) {
-    return fluidFaceClosed(axis, f, res) ? 0.0 : fluidVelAt(axis, f, res);
+    return fluidFaceClosed(axis, f, res) ? fluidClosedFaceVelocity(axis, f, res)
+                                         : fluidVelAt(axis, f, res);
 }
 
 void main() {

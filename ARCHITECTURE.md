@@ -653,8 +653,10 @@ never touches water pays nothing for it.
 ## A step
 
 `FluidSim::recordStep` records the whole thing into the frame's command list,
-ahead of the marcher. The order *is* the algorithm, so it lives in one function
-rather than spread through the frame loop:
+ahead of the marcher. It re-bakes the obstacle field first when the scene has
+changed since the last frame (see Moving obstacles below), then runs the
+substeps. The order *is* the algorithm, so it lives in one function rather than
+spread through the frame loop:
 
 1. **Advect** velocity and the level set — semi-Lagrangian, RK2 backtrace — and
    add gravity. One dispatch for both fields, because they share the thread
@@ -797,16 +799,104 @@ picture without pretending to move the simulation.
 Also not here: no viscosity, no surface tension, no two-phase air, no adaptive
 or hierarchical grid, no fractional face areas at obstacles, no vorticity
 confinement, no multigrid or preconditioned CG, no resampling of the level set
-when the resolution changes (it re-seeds instead), no moving-obstacle velocity
-coupling — an animated primitive moves the walls the water sees, but transfers
-no momentum to it.
+when the resolution changes (it re-seeds instead), and no no-slip walls — an
+obstacle constrains the flow through its surface, never along it.
+
+## Moving obstacles
+
+An animated primitive pushes the water. It does so without the solver ever
+being told what the primitive is doing.
+
+The trick is that the obstacle field already contains the answer. A level set
+transported by a velocity satisfies
+
+```
+    phi_t + v . grad(phi) = 0
+```
+
+and on a field that is a distance function (`|grad phi| = 1`) that rearranges to
+`v . n = -phi_t`. So the obstacle bake — which is the pass that overwrites the
+previous obstacle field, and therefore the only pass that can see both — stores
+one extra scalar per cell: how fast the surface there is moving along its own
+normal. The direction comes from the gradient at the point of use. There is no
+per-primitive velocity buffer, no owner index threaded through the CSG fold, and
+no new path between the engine and the shaders.
+
+Every pass that used to write a hard zero at a closed face now writes that
+boundary velocity instead, and the momentum enters through the divergence: a
+fluid cell whose obstacle-side face carries an inflow no longer balances, and
+the pressure solve builds exactly the pressure that pushes the water out of the
+way. The Laplacian is untouched — the solid neighbour is still excluded, still
+Neumann. This is the standard inhomogeneous free-slip condition; only the way
+the boundary velocity is obtained is unusual.
+
+**Only the normal component is recoverable that way**, because a sphere spinning
+in place has `phi_t = 0` everywhere. That is also the only component wanted: the
+condition here is free-slip, constraining `u . n` and leaving the tangential flow
+alone, so a spinning obstacle drags nothing around with it. A no-slip wall would
+need the tangential velocity too, and *that* genuinely would need per-primitive
+motion data.
+
+### Motion versus jump
+
+The bake differences two states, so it needs to know how long the interval was —
+and, more importantly, whether the change was an interval at all. A primitive
+that moved 3 cm in a frame has a velocity. A primitive that was dragged with the
+gizmo, retyped, loaded from a file, undone, or reached by scrubbing the timeline
+has no duration to divide by; differencing across one of those and calling the
+result a velocity would fling the water across the tank.
+
+So the engine passes the interval and zero means "jump":
+
+- the animation advancing **while a clip is playing** hands over the frame's
+  own length,
+- everything else — an edit, a load, an undo, a scrub, the first bake of a run —
+  hands over zero, and the boundary velocity is the plain zero it always was.
+
+That distinction lives in `Application`, which is the only layer that knows why
+the edit list changed. `FluidSim::invalidateSolids(motionSeconds)` takes it, and
+several invalidations landing before one bake collapse to the largest.
+
+One consequence is worth stating because it looks like a bug the first time:
+the bake runs when the scene changes, so a frame with no change leaves the speed
+field holding the last motion. An obstacle that stopped would go on shoving
+water forever. The frame after the last motion therefore clears that field,
+exactly once — `m_solidSpeedLive` is the flag that makes it once rather than
+every frame.
+
+### What it costs
+
+One `res^3` scalar field, and a stationary scene pays nothing beyond it: the
+speed reads zero, the helper returns before it computes a gradient, and
+`scenes/dambreak.json` renders **bit-identical** with the coupling compiled in
+(`max 0.000000` against the dump taken before it existed).
+
+The coupling is first-order in the same way the rest of the obstacle handling
+is: a face is either closed or open, with no fractional area, so an obstacle
+moving slower than about a cell per step is resolved in steps rather than
+smoothly. Water in a cell the obstacle moves *into* is not pushed out but simply
+stops being water, and reappears behind — the volume figure dips and recovers as
+the obstacle passes. Fractional face areas would fix both, and are the obvious
+next refinement here.
+
+`scenes/paddle.json` is the worked example: a still pool and a blade sweeping
+through it, with `--play` to run the clip headlessly. Turning `Obstacle
+momentum` off in the panel is the A/B — the same frame becomes a flat pool with
+a blade sliding through it, untouched.
 
 ## Determinism
 
-A pinned run (`--dump` / `--compare`) spends a fixed substep budget per frame
-instead of following the wall clock, so the water's state is a function of the
-frame index alone — the same reasoning as the pinned animation clock and the
-frozen camera.
+A pinned run (`--dump` / `--compare`) declares every frame to be the same length
+— `Application::simulationDelta` — instead of following the wall clock.
+Everything that integrates reads it from there: the animation playhead, the
+obstacle velocity the water feels, and the fluid's substep budget. So the world
+becomes a function of the frame index alone, and two runs of it agree. Without
+that single source, a moving obstacle would travel a wall-clock-dependent
+distance per frame and no pinned run of an animated scene could reproduce.
+
+`--play` starts the clip playing, which is what makes a headless run of an
+animated scene move at all; without it the playhead sits at zero and an animated
+scene dumps its rest pose.
 
 Agreement between paths is weaker here than elsewhere in the project, and
 honestly so. Both comparisons below are `scenes/dambreak.json` at frame 100,
@@ -817,6 +907,23 @@ against a 1/255 per-component tolerance:
 | dry scene, Vulkan vs OpenGL, reference | 0% (max one ULP) | 0.000000 | 0 |
 | dam break, Vulkan vs OpenGL, reference | 4.2% | 0.0017 | 0 |
 | dam break, reference vs brick, Vulkan | 10.2% | 0.0047 | 0 |
+| paddle, reference vs brick, Vulkan | 11.2% | 0.0038 | 0 |
+
+That the first effect really is chaos rather than a backend disagreement is
+checkable, and worth checking rather than asserting. Running `scenes/paddle.json`
+on both backends and stopping at three different frames:
+
+| Frames simulated | Components outside tolerance | Mean |
+|---|---|---|
+| 20 | 2.9% | 0.0013 |
+| 60 | 10.8% | 0.0035 |
+| 90 | 16.4% | 0.0057 |
+
+A systematic difference between the backends would be there at frame 20 and stay
+put. One that grows monotonically with simulated time is a rounding difference
+being amplified, which is what a liquid does to any perturbation. The paddle
+scene is the worst case for it: a large, nearly flat sheet whose entire motion
+comes from one obstacle, so there is no violent foreground to hide behind.
 
 Neither wet figure is a defect, and the difference image says why: half the
 frame is bit-identical, and every component that differs is on the churning
@@ -845,7 +952,9 @@ restore the tank's obstacles and not the tank. A file with no `fluid` block
 leaves the running settings alone, so an older scene loaded into a live editor
 does not silently reset the water. `scenes/dambreak.json` is the worked example:
 a column of water behind an invisible dam, a shallow pool, and four obstacles
-for it to break over.
+for it to break over. `scenes/paddle.json` is the other one — a still pool and a
+keyframed blade sweeping through it, which is the moving-obstacle coupling with
+nothing else going on to obscure it.
 
 ---
 
@@ -1185,6 +1294,10 @@ as JSON. Editing re-uploads the edit list and re-bakes the brick path live; the
 panel reports FPS, the active renderer and the last re-bake time. The OpenGL
 backend runs without the overlay, unchanged. `--scene` loads a scene file at
 startup and `--save-scene` writes one and exits.
+
+An animated obstacle transfers momentum to the water (`--play`, and
+`scenes/paddle.json`); with the coupling switched off in the panel the same
+frame shows a flat pool with a blade sliding through it.
 
 Reference-vs-brick agrees within the documented outlier tolerance
 (`--max-outlier-fraction`); the brick image is bit-identical across the two
