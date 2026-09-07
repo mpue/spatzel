@@ -10,8 +10,10 @@
 
 namespace {
 
-void printUsage() {
-    std::fprintf(stderr,
+// stderr for the error paths, stdout for an explicit --help: a message the
+// caller asked for is output, not a diagnostic.
+void printUsage(std::FILE* out = stderr) {
+    std::fprintf(out,
                  "usage: fitzel [options]\n"
                  "  --backend <vulkan|opengl>  graphics backend (default: vulkan)\n"
                  "  --renderer <brick|reference>  renderer (default: brick)\n"
@@ -76,6 +78,13 @@ int main(int argc, char** argv) {
             const std::string_view arg(argv[i]);
             const bool             hasValue = i + 1 < argc;
 
+            if (arg == "--help" || arg == "-h") {
+                // Asking for the option list is not an error: it prints to
+                // stdout and succeeds, so it can be piped without a shell
+                // reporting a failure.
+                printUsage(stdout);
+                return 0;
+            }
             if (arg == "--backend" && hasValue) {
                 if (!parseBackend(argv[++i], config.backend)) {
                     std::fprintf(stderr, "unknown backend '%s'\n", argv[i]);
