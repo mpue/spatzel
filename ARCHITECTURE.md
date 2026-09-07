@@ -925,6 +925,14 @@ being amplified, which is what a liquid does to any perturbation. The paddle
 scene is the worst case for it: a large, nearly flat sheet whose entire motion
 comes from one obstacle, so there is no violent foreground to hide behind.
 
+The same reasoning covers Debug against Release. `scenes/dambreak.json` is
+**bit-identical** between the two configurations — everything the CPU feeds that
+simulation is a constant. `scenes/paddle.json` is not (1.9% at 20 frames, 7.9%
+at 50, 9.5% at 90), because its obstacle pose is interpolated on the CPU every
+frame and the two configurations do not have to agree on the last bit of that
+interpolation. Same growth curve, same cause, a different place for the
+perturbation to enter.
+
 Neither wet figure is a defect, and the difference image says why: half the
 frame is bit-identical, and every component that differs is on the churning
 surface, in the refracted view of a submerged object, or in the thin band where
@@ -1191,6 +1199,33 @@ CMake ≥ 3.24, all dependencies via `FetchContent` (pinned tags), C++20.
   backend is compiled inside `fitzel_rhi_vulkan` with `IMGUI_IMPL_VULKAN_USE_VOLK`
   so it resolves entry points through volk like the rest of the backend.
 - nlohmann/json `v3.11.3` — human-readable scene files.
+
+### Staging is per-configuration, and that was a bug
+
+Compiled shaders and example scenes are copied next to the executable, into
+`$<TARGET_FILE_DIR:fitzel>` — which on a multi-config generator is `bin/Debug`
+*or* `bin/Release`. Both copies were driven by a **single** stamp file, so
+whichever configuration built first marked the copy up to date and the other
+never received the new files again.
+
+The result is a failure with no honest symptom. Every source file is current,
+the build reports success, `check_seam` passes — and one of the two binaries
+loads a SPIR-V module from an earlier build. It surfaced as a feature that
+worked in Debug and did nothing at all in Release, which sends you looking for
+undefined behaviour, a race, or an optimiser difference. It was none of those:
+`bin/Release/shaders/vulkan/fluid_solids.comp.spv` was simply a day old, and
+still contained the version of the pass from before the moving-obstacle
+coupling existed. The tell was the file size, not anything in the code.
+
+Both stamps now carry `$<CONFIG>`, so each configuration tracks its own
+destination. The scene staging was fixed the same way and additionally moved off
+the executable's `POST_BUILD`: editing a scene file does not relink, so a
+POST_BUILD copy would never have run at all. Its glob uses `CONFIGURE_DEPENDS`
+so a newly added scene re-globs on the next build.
+
+The general rule, worth stating because it is easy to reintroduce: **a stamp
+file must be as specific as the thing it claims is up to date.** A stamp that
+guards a per-configuration destination has to be per-configuration.
 
 ### Linux in a container
 

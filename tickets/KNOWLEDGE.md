@@ -10,6 +10,12 @@ detail into `knowledge/<topic>.md` and link it here.
   Generator is `Visual Studio 18 2026`, multi-config, build tree in `build/`.
   `& $cmake --build build --config Debug --target fitzel` (also `Release`).
   `build.ps1` / `build.cmd` are the wrappers the project ships.
+- Shader and scene staging is per-configuration (`$<CONFIG>` in the stamp path).
+  It was not, and the consequence was a Release binary silently loading
+  build-old SPIR-V while every source file looked current — if a change works in
+  Debug and does nothing in Release, compare
+  `build/bin/<config>/shaders/vulkan/*.spv` against `build/shaders/shaders/`
+  before suspecting the code.
 - Pre-existing warning C5054 at `src/engine/editor.cpp:123` (mixed ImGui enum
   `|`). Not a regression; ignore it.
 - Running the app needs a real window/GPU, so agent sessions verify by building

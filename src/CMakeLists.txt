@@ -105,8 +105,24 @@ endif()
 
 # Stage the example scenes next to the executable, where the editor's Examples
 # list looks and where relative --scene paths resolve.
-add_custom_command(TARGET fitzel POST_BUILD
+#
+# Driven by a stamp for the same two reasons the shader staging is (see
+# fitzel_stage_shaders): editing a scene file does not relink the executable, so
+# a POST_BUILD copy would never run and the binary would keep loading the scene
+# it was linked with; and the stamp is per-configuration because the destination
+# is, so one configuration cannot mark the other's copy up to date.
+#
+# CONFIGURE_DEPENDS so that adding a scene file re-globs on the next build
+# rather than needing a manual re-configure.
+file(GLOB FITZEL_SCENE_FILES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/scenes/*.json")
+set(FITZEL_SCENES_STAMP "${CMAKE_CURRENT_BINARY_DIR}/scenes.$<CONFIG>.staged")
+add_custom_command(
+    OUTPUT "${FITZEL_SCENES_STAMP}"
     COMMAND "${CMAKE_COMMAND}" -E copy_directory
             "${CMAKE_SOURCE_DIR}/scenes" "$<TARGET_FILE_DIR:fitzel>/scenes"
+    COMMAND "${CMAKE_COMMAND}" -E touch "${FITZEL_SCENES_STAMP}"
+    DEPENDS ${FITZEL_SCENE_FILES}
     COMMENT "Staging example scenes next to fitzel"
     VERBATIM)
+add_custom_target(fitzel_scenes_stage ALL DEPENDS "${FITZEL_SCENES_STAMP}")
+add_dependencies(fitzel fitzel_scenes_stage)

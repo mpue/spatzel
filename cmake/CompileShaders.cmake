@@ -113,12 +113,21 @@ endfunction()
 # would silently keep loading the previously staged shader. Depending on the
 # outputs makes the copy re-run exactly when a variant is recompiled; the exe
 # depends on the stamp so a normal build still stages before it runs.
+#
+# The stamp is per-CONFIGURATION, and that is not a detail. The destination is
+# $<TARGET_FILE_DIR:EXE>, which on a multi-config generator is bin/Debug or
+# bin/Release — two destinations. One shared stamp would be marked up to date by
+# whichever configuration built first, and the other would never receive the new
+# shaders again: the Release binary would go on loading a build-old SPIR-V while
+# every source file said otherwise. That failure is close to undiagnosable from
+# the outside, because the C++ is current, the shader source is current, and only
+# the compiled artifact next to one of the two executables is not.
 function(fitzel_stage_shaders EXE SHADER_TARGET)
     get_property(_dir     TARGET ${SHADER_TARGET} PROPERTY FITZEL_SHADER_DIR)
     get_property(_subdir  TARGET ${SHADER_TARGET} PROPERTY FITZEL_SHADER_SUBDIR)
     get_property(_outputs TARGET ${SHADER_TARGET} PROPERTY FITZEL_SHADER_OUTPUTS)
 
-    set(_stamp "${CMAKE_CURRENT_BINARY_DIR}/${SHADER_TARGET}.staged")
+    set(_stamp "${CMAKE_CURRENT_BINARY_DIR}/${SHADER_TARGET}.$<CONFIG>.staged")
     add_custom_command(
         OUTPUT "${_stamp}"
         COMMAND "${CMAKE_COMMAND}" -E copy_directory
